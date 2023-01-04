@@ -10,21 +10,43 @@ app.use(function(req, res, next) {
   next();
 });
 
+app.use((err:any, req:any, res:any, next:any) => {
+    res.locals.error = err.response.data;
+    const status = err.status || 500;
+    res.status(status);
+    res.render('error');
+});
 
 app.get("/root", function(req, res) {
-   
-    res.send(anthillGraph[anthillRootId()]);
+    console.log("getting root")
+    res.send({"anthillGraphNum": anthillGraphNum, "nodeData":anthillGraph[anthillRootId()]});
 });    
 
-app.get("/relRootDepth", function(req, res) {
-   
-    res.send(relRootDepth);
+app.get("/anthillGraphNum", function(req, res) {
+    console.log("getting anthillGraphNum")
+    res.send({"anthillGraphNum": anthillGraphNum});
+    console.log("sent anthillGraphNum")
+
+});    
+
+
+app.get("/maxRelRootDepth", function(req, res) {
+    console.log("getting max rel root");
+    res.send({"maxRelRootDepth": maxRelRootDepth});
+    
 });
 
 app.get("/id/:id", function(req, res) {
- 
-    res.send(anthillGraph[req.params.id]);
+    console.log("getting id: ", req.params.id)
 
+    res.send({"anthillGraphNum": anthillGraphNum, "nodeData":anthillGraph[req.params.id]});
+});
+
+app.get("/getRelRoot/:id", function(req, res) {
+    console.log("getting rel root: ", req.params.id)
+    
+    var [nodeData, depthDiff] = getRelRoot(req.params.id);
+    res.send({"anthillGraphNum": anthillGraphNum, "nodeData":nodeData, "depthDiff": depthDiff});
 });
 
 let port = process.env.PORT;
@@ -39,7 +61,7 @@ app.listen(port, function() {
     crawlEthereum();
     console.log("Finished crawling ethereum for data");
 
-    getAnthillRelRootDepth();
+    getAnthillMaxRelRootDepth();
 });
 
 
@@ -47,15 +69,15 @@ app.listen(port, function() {
 
 // web3
 var Web3 = require('web3');
-const anvilUrl = "http://localhost:8545";
+const anvilUrl = "ws://localhost:8545";
 var web3 = new Web3(anvilUrl);
 
 // contract
-const antHillContractAddress = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+const anthillContractAddress = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
 var fs = require('fs');
 var jsonFile = "../anthill/out/Anthill.sol/Anthill.json"
 var contract= JSON.parse(fs.readFileSync(jsonFile));
-var AnthillContract = new web3.eth.Contract(contract.abi, antHillContractAddress);
+var AnthillContract = new web3.eth.Contract(contract.abi, anthillContractAddress);
 
 
 // types
@@ -63,7 +85,8 @@ type GraphData= {[id: string]: NodeData;}
 type NodeData = {"id":string, "name":string, "parentIds":string[], "treeParentId": string, "childIds":string[], }
 
 var anthillGraph = {} as GraphData;
-var relRootDepth = 6;
+var anthillGraphNum =0;
+var maxRelRootDepth = 6;
 
 
 function anthillRootId() {
@@ -72,10 +95,22 @@ function anthillRootId() {
 }
 
 
-async function getAnthillRelRootDepth() {
-    const res = await AnthillContract.methods.readRelRootDepth().call();
-    relRootDepth = res;
+async function getAnthillMaxRelRootDepth() {
+    const res = await AnthillContract.methods.readMaxRelRootDepth().call();
+    maxRelRootDepth = res;
     
+}
+
+function getRelRoot(id: string): [NodeData, number] {
+    var node = anthillGraph[id];
+    var relRoot = node;
+    var depthDiff = 0;
+
+    while (relRoot.treeParentId != ""){
+        depthDiff +=1;
+        relRoot = anthillGraph[relRoot.treeParentId];
+    }
+    return [relRoot, depthDiff];
 }
 
 async function loadDagVotes(id : string) : Promise<string[]>{
@@ -86,7 +121,7 @@ async function loadDagVotes(id : string) : Promise<string[]>{
     var sentDagVoteCountString="" ;
 
 
-    for (var i = 0; i < relRootDepth; i++) {
+    for (var i = 0; i < maxRelRootDepth; i++) {
         sentDagVoteCountString  = await AnthillContract.methods.readSentDagVoteCount(id, i+sentDagVoteDiff).call();
         for (var j= 0; j< parseInt(sentDagVoteCountString); j++){
             var childId = await AnthillContract.methods.readSentDagVote(id, i+sentDagVoteDiff, j).call();
@@ -115,11 +150,33 @@ async function loadSaveChildren(id: string){
 }
 
 async function crawlEthereum() {
-    // what we want to do here is call the root method in the smart contract, this should return an address
-    // with this address we can start crawling the tree
-    // for each node we visit, we want to add it to the AnthillGraph
 
-    //call root, we fixed it as 2:
+    loadAnthillGraph();
+   
+    // start subscription
+    console.log("will we see logs?")
+    var subscription = web3.eth.subscribe('logs', {"address": anthillContractAddress},
+         function(error:any, result:any){ 
+            if (!error){
+                loadAnthillGraph();
+            } else {console.log("we had some error!", error)}
+        }
+    )
+    // we could call this in the future for more complicated things, see web3.eth docs.
+    // .on('data', function( result:any){ 
+    //     if (result){
+    //         console.log("some data logged!")
+    //         console.log(result)
+    //         loadAnthillGraph();
+    //     } else {console.log("we had some in data, response was none")}; 
+    // })
+    
+}
+
+function loadAnthillGraph() {
+    anthillGraph = {} as GraphData;
+    anthillGraphNum +=1;
+
     var rootId : string= anthillRootId();
     var rootName : string= rootId.slice(-4);
 
@@ -127,4 +184,5 @@ async function crawlEthereum() {
     anthillGraph[rootId] = node;
 
     loadSaveChildren(rootId);
+    
 }
