@@ -154,12 +154,11 @@ async function crawlEthereum() {
     loadAnthillGraph();
    
     // start subscription
-    console.log("will we see logs?")
     var subscription = web3.eth.subscribe('logs', {"address": anthillContractAddress},
          function(error:any, result:any){ 
             if (!error){
                 loadAnthillGraph();
-            } else {console.log("we had some error!", error)}
+            } else {console.log("we had some error in the eth subscription!", error)}
         }
     )
     // we could call this in the future for more complicated things, see web3.eth docs.
