@@ -41,6 +41,7 @@ app.get("/id/:id", function(req, res) {
 
 app.get("/bareId/:id", function(req, res) {
     console.log("getting bare id: ", req.params.id)
+    console.log("displaying: ", anthillGraphServe[req.params.id])
     var nodeData = anthillGraphServe[req.params.id]
     
     res.send({"nodeData":nodeData as NodeDataBare});
@@ -143,13 +144,17 @@ async function getSentDagVotes(id : string) : Promise<DagVote[]>{
     
     var sentDagVoteCountString="" ;
 
-
-    for (var i = 0; i < maxRelRootDepth; i++) {
-        sentDagVoteCountString  = await AnthillContract.methods.readSentDagVoteCount(id, i).call();
-        for (var j= 0; j< parseInt(sentDagVoteCountString); j++){
-            var sDagVote = await AnthillContract.methods.readSentDagVote(id, i, j).call();
-            dagVotes.push({"id":sDagVote.id , "weight":sDagVote.weight, "posInOther":sDagVote.posInOther});
-           
+    for (var dist =0; dist < maxRelRootDepth; dist++){
+        for (var depth = 0; depth < maxRelRootDepth; depth++) {
+            sentDagVoteCountString  = await AnthillContract.methods.readSentDagVoteCount(id, dist, depth).call();
+            for (var j= 0; j < parseInt(sentDagVoteCountString); j++){
+                var sDagVote = await AnthillContract.methods.readSentDagVote(id, dist, depth, j).call();
+                if (sDagVote.id == "0x0000000000000000000000000000000000000000"){
+                    continue;
+                }
+                dagVotes.push({"id":sDagVote.id , "weight":sDagVote.weight, "posInOther":sDagVote.posInOther});
+            
+            }
         }
     }
     return dagVotes;
@@ -160,12 +165,16 @@ async function getRecDagVotes(id : string) : Promise<DagVote[]>{
     var dagVotes= [];
     var recDagVoteCountString="" ;
 
-
-    for (var i = 0; i < maxRelRootDepth; i++) {
-        recDagVoteCountString  = await AnthillContract.methods.readRecDagVoteCount(id, i).call();
-        for (var j= 0; j< parseInt(recDagVoteCountString); j++){
-            var rDagVote = await AnthillContract.methods.readRecDagVote(id, i, j).call();
-            dagVotes.push({"id":rDagVote.id , "weight":rDagVote.weight, "posInOther":rDagVote.posInOther});
+    for (var dist = 0; dist < maxRelRootDepth; dist++) {
+        for (var depth = 0; depth < maxRelRootDepth; depth++) {
+            recDagVoteCountString  = await AnthillContract.methods.readRecDagVoteCount(id, dist, depth).call();
+            for (var j= 0; j< parseInt(recDagVoteCountString); j++){
+                var rDagVote = await AnthillContract.methods.readRecDagVote(id, dist, depth, j).call();
+                if (rDagVote.id == "0x0000000000000000000000000000000000000000"){
+                    continue;
+                }
+                dagVotes.push({"id":rDagVote.id , "weight":rDagVote.weight, "posInOther":rDagVote.posInOther});
+            }
         }
     }
     return dagVotes;
