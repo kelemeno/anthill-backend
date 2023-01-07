@@ -26,22 +26,22 @@ app.get("/maxRelRootDepth", function(req, res) {
 
 app.get("/rootId", function(req, res) {
     console.log("getting root")
-    res.send({"id":anthillRootId});
+    res.send({"id":anthillRootIdServe});
 });
 
 app.get("/anthillGraphNum", function(req, res) {
     console.log("getting anthillGraphNum")
-    res.send({"anthillGraphNum": anthillGraphNum});
+    res.send({"anthillGraphNum": anthillGraphNumServe});
 });   
 
 app.get("/id/:id", function(req, res) {
     console.log("getting id: ", req.params.id)
-    res.send({"nodeData":anthillGraph[req.params.id]});
+    res.send({"nodeData":anthillGraphServe[req.params.id]});
 });
 
 app.get("/bareId/:id", function(req, res) {
     console.log("getting bare id: ", req.params.id)
-    var nodeData = anthillGraph[req.params.id]
+    var nodeData = anthillGraphServe[req.params.id]
     
     res.send({"nodeData":nodeData as NodeDataBare});
 });
@@ -61,7 +61,16 @@ app.listen(port, function() {
     getAnthillMaxRelRootDepth();
 });
 
+var anthillGraphServe = {} as GraphData;
+var anthillGraphNumServe =0;
+var anthillRootIdServe = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
+function replaceServe(){
+
+    anthillGraphServe = anthillGraph;
+    anthillGraphNumServe = anthillGraphNum;
+    anthillRootIdServe = anthillRootId;
+}
 //////////////////////
 
 // web3
@@ -83,7 +92,7 @@ export type NodeData = {"id":string, "name":string, "totalWeight":number; "oncha
 
 export type NodeDataBare = {"id":string, "name":string,  "totalWeight":number; "onchainRep":number, "currentRep": number, "depth":number, "relRoot":string, "sentTreeVote": string,}
 
-type DagVote = {'id': string, 'weight': number, 'otherPos': number}
+type DagVote = {'id': string, 'weight': number, 'posInOther': number}
 
 
 var anthillGraph = {} as GraphData;
@@ -92,6 +101,13 @@ var maxDepth = 0;
 var anthillGraphNum =0;
 var maxRelRootDepth = 6;
 var anthillRootId = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+function resetIntermediate(){
+    anthillGraph = {} as GraphData;
+    anthillGraphByDepth = [[]] as string[][];
+    maxDepth = 0;
+    anthillRootId = "0x0000000000000000000000000000000000000000000000000000000000000000";
+}
 
 async function getAnthillMaxRelRootDepth() {
     const res = await AnthillContract.methods.readMaxRelRootDepth().call();
@@ -104,6 +120,7 @@ async function getAnthillRootId() {
     anthillRootId = res;
     return res;
 }
+
 
 
 async function getAnthillName(id: string):Promise<string> {
@@ -131,8 +148,8 @@ async function getSentDagVotes(id : string) : Promise<DagVote[]>{
         sentDagVoteCountString  = await AnthillContract.methods.readSentDagVoteCount(id, i).call();
         for (var j= 0; j< parseInt(sentDagVoteCountString); j++){
             var sDagVote = await AnthillContract.methods.readSentDagVote(id, i, j).call();
-            /// the problem is here
-            dagVotes.push(sDagVote);
+            dagVotes.push({"id":sDagVote.id , "weight":sDagVote.weight, "posInOther":sDagVote.posInOther});
+           
         }
     }
     return dagVotes;
@@ -148,7 +165,7 @@ async function getRecDagVotes(id : string) : Promise<DagVote[]>{
         recDagVoteCountString  = await AnthillContract.methods.readRecDagVoteCount(id, i).call();
         for (var j= 0; j< parseInt(recDagVoteCountString); j++){
             var rDagVote = await AnthillContract.methods.readRecDagVote(id, i, j).call();
-            dagVotes.push(rDagVote);
+            dagVotes.push({"id":rDagVote.id , "weight":rDagVote.weight, "posInOther":rDagVote.posInOther});
         }
     }
     return dagVotes;
@@ -169,7 +186,6 @@ async function getSaveChildren(id: string){
         anthillGraph[childId] = childNode;
 
         // we push the children here instead of in the childnode initialisation above, as we are already crawling the tree. 
-        console.log("did we push for "+ id +" the child  " + childId)
         anthillGraph[id].recTreeVotes.push(childId);
 
         await getSaveChildren(childId);
@@ -182,7 +198,6 @@ async function loadAnthillGraph(){
     anthillGraphNum +=1;
 
     var id : string= await getAnthillRootId();
-    console.log("the root is: " + id )
     anthillRootId=id;
     var onChainRep = await getAnthillReputation(id);
     var name = await getAnthillName(id);
@@ -201,13 +216,17 @@ async function crawlEthereum() {
 
     calculateDepthAndRelRoot();
     calculateReputation();
-   
+    replaceServe();
 
     // start subscription
     var subscription = web3.eth.subscribe('logs', {"address": anthillContractAddress},
-         function(error:any, result:any){ 
+         async function(error:any, result:any){ 
             if (!error){
-                loadAnthillGraph();
+                
+                await loadAnthillGraph();
+                calculateDepthAndRelRoot();
+                calculateReputation();
+                replaceServe();
             } else {console.log("we had some error in the eth subscription!", error)}
         }
     )
@@ -240,6 +259,7 @@ function calculateDepthAndRelRootInner(id:string, depth: number, parents: string
 }
 
 function calculateReputation(){
+  
     for (var i = maxDepth; i >= 0; i--) {
         anthillGraphByDepth[i].forEach((id) => {
             var node = anthillGraph[id];
