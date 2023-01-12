@@ -41,7 +41,7 @@ app.get("/id/:id", function(req, res) {
 
 app.get("/bareId/:id", function(req, res) {
     console.log("getting bare id: ", req.params.id)
-    console.log("displaying: ", anthillGraphServe[req.params.id])
+    // console.log("displaying: ", anthillGraphServe[req.params.id])
     var nodeData = anthillGraphServe[req.params.id]
     
     res.send({"nodeData":nodeData as NodeDataBare});
@@ -208,12 +208,17 @@ async function loadAnthillGraph(){
 
     var id : string= await getAnthillRootId();
     anthillRootId=id;
+    console.log("root is: " + id);
     var onChainRep = await getAnthillReputation(id);
     var name = await getAnthillName(id);
     var sentTreeVote = await AnthillContract.methods.readSentTreeVote(id).call();
 
+    var recDagVotes: DagVote[]= await getRecDagVotes(id);
+    var totalWeight = await getAnthillTotalWeight(id);
 
-    var node = {"id": id, "name": name, "totalWeight":0, "onchainRep":onChainRep, "currentRep": 0, "depth":0, "relRoot": "", "sentTreeVote": sentTreeVote ,  "recTreeVotes": [], "sentDagVotes": [],"recDagVotes":[]} as NodeData;
+
+
+    var node = {"id": id, "name": name, "totalWeight":totalWeight, "onchainRep":onChainRep, "currentRep": 0, "depth":0, "relRoot": "", "sentTreeVote": sentTreeVote ,  "recTreeVotes": [], "sentDagVotes": [],"recDagVotes":recDagVotes} as NodeData;
     anthillGraph[id] = node;
 
     await getSaveChildren(id);
