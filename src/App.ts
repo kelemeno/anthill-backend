@@ -29,6 +29,16 @@ app.get("/rootId", function(req, res) {
     res.send({"id":anthillRootIdServe});
 });
 
+app.get("/isNodeInGraph/:id", function(req, res) {
+    console.log("isNodeInGraph")
+    if (anthillGraphServe[req.params.id] === undefined){
+        res.send({"isNodeInGraph": false});
+    } else {
+        res.send({"isNodeInGraph": true});
+    }
+    
+});  
+
 app.get("/anthillGraphNum", function(req, res) {
     console.log("getting anthillGraphNum")
     res.send({"anthillGraphNum": anthillGraphNumServe});
@@ -45,6 +55,12 @@ app.get("/bareId/:id", function(req, res) {
     var nodeData = anthillGraphServe[req.params.id]
     
     res.send({"nodeData":nodeData as NodeDataBare});
+});
+
+app.get("/randomLeaf", function(req, res) {
+    console.log("getting random leaf")
+    
+    res.send({"randomLeaf":randomLeafServe});
 });
 
 let port = process.env.PORT;
@@ -65,12 +81,15 @@ app.listen(port, function() {
 var anthillGraphServe = {} as GraphData;
 var anthillGraphNumServe =0;
 var anthillRootIdServe = "0x0000000000000000000000000000000000000000000000000000000000000000";
+var randomLeafServe = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
 
 function replaceServe(){
 
     anthillGraphServe = anthillGraph;
     anthillGraphNumServe = anthillGraphNum;
     anthillRootIdServe = anthillRootId;
+    randomLeafServe = randomLeaf;
 }
 //////////////////////
 
@@ -80,7 +99,8 @@ const anvilUrl = "ws://localhost:8545";
 var web3 = new Web3(anvilUrl);
 
 // contract
-const anthillContractAddress = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+const anthillContractAddress = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
+// "0x5fbdb2315678afecb367f032d93f642f64180aa3"
 var fs = require('fs');
 var jsonFile = "../anthill/out/Anthill.sol/Anthill.json"
 var contract= JSON.parse(fs.readFileSync(jsonFile));
@@ -91,7 +111,7 @@ var AnthillContract = new web3.eth.Contract(contract.abi, anthillContractAddress
 type GraphData= {[id: string]: NodeData;}
 export type NodeData = {"id":string, "name":string, "totalWeight":number; "onchainRep":number, "currentRep": number, "depth":number,  "relRoot":string,  "sentTreeVote": string, "recTreeVotes":string[], "sentDagVotes":DagVote[], "recDagVotes": DagVote[]}
 
-export type NodeDataBare = {"id":string, "name":string,  "totalWeight":number; "onchainRep":number, "currentRep": number, "depth":number, "relRoot":string, "sentTreeVote": string,}
+export type NodeDataBare = {"id":string, "name":string,  "totalWeight":number; "onchainRep":number, "currentRep": number, "depth":number, "relRoot":string, "sentTreeVote": string, "recTreeVotes": string []}
 
 type DagVote = {'id': string, 'weight': number, 'posInOther': number}
 
@@ -102,6 +122,7 @@ var maxDepth = 0;
 var anthillGraphNum =0;
 var maxRelRootDepth = 6;
 var anthillRootId = "0x0000000000000000000000000000000000000000000000000000000000000000";
+var randomLeaf =    "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 function resetIntermediate(){
     anthillGraph = {} as GraphData;
@@ -183,7 +204,7 @@ async function getRecDagVotes(id : string) : Promise<DagVote[]>{
 async function getSaveChildren(id: string){
     var childCount  = await AnthillContract.methods.readRecTreeVoteCount(id).call();
     for (var i = 0; i < childCount; i++) {
-        var childId = await AnthillContract.methods.readRecTreeVote(id, i).call();
+        var childId = (await AnthillContract.methods.readRecTreeVote(id, i).call());
 
         var sentDagVotes: DagVote[]= await getSentDagVotes(childId);
         var recDagVotes: DagVote[]= await getRecDagVotes(childId);
@@ -203,10 +224,11 @@ async function getSaveChildren(id: string){
 }
 
 async function loadAnthillGraph(){
-    anthillGraph = {} as GraphData;
+    resetIntermediate();
+
     anthillGraphNum +=1;
 
-    var id : string= await getAnthillRootId();
+    var id : string= (await getAnthillRootId());
     anthillRootId=id;
     console.log("root is: " + id);
     var onChainRep = await getAnthillReputation(id);
@@ -228,18 +250,22 @@ async function crawlEthereum() {
 
     await loadAnthillGraph()
 
+    
     calculateDepthAndRelRoot();
     calculateReputation();
+    findRandomLeaf();
     replaceServe();
 
     // start subscription
-    var subscription = web3.eth.subscribe('logs', {"address": anthillContractAddress},
+    web3.eth.subscribe('logs', {"address": anthillContractAddress},
          async function(error:any, result:any){ 
             if (!error){
                 
                 await loadAnthillGraph();
                 calculateDepthAndRelRoot();
                 calculateReputation();
+                findRandomLeaf();
+
                 replaceServe();
             } else {console.log("we had some error in the eth subscription!", error)}
         }
@@ -285,4 +311,14 @@ function calculateReputation(){
             });
         });
     }
+}
+
+function findRandomLeaf(){
+    var nodeId = anthillRootId;
+    // console.log("finding random leaf", nodeId, anthillGraph[nodeId], anthillGraph[nodeId].recTreeVotes)
+    while (anthillGraph[nodeId].recTreeVotes.length == 2){
+        var rand = Math.floor(Math.random() * 2);
+        nodeId = anthillGraph[nodeId].recTreeVotes[rand];
+    }
+    randomLeaf = nodeId;
 }
