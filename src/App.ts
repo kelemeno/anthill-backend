@@ -105,7 +105,7 @@ var web3 = new Web3(providerURL);
 
 // contract
 const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai
-// "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
+// const anthillContractAddress = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
 // "0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
 var fs = require('fs');
 var jsonFile = "./Anthill.json"
@@ -166,6 +166,11 @@ async function getAnthillTotalWeight(id: string):Promise<number> {
     return res;
 }
 
+function delay(ms: number) {
+    return new Promise( resolve => setTimeout(resolve, ms) );
+}
+const timeout=100;
+
 async function getSentDagVotes(id : string) : Promise<DagVote[]>{
     var dagVotes= [];
     
@@ -175,6 +180,7 @@ async function getSentDagVotes(id : string) : Promise<DagVote[]>{
         for (var depth = 0; depth < maxRelRootDepth; depth++) {
             sentDagVoteCountString  = await AnthillContract.methods.readSentDagVoteCount(id, dist, depth).call();
             for (var j= 0; j < parseInt(sentDagVoteCountString); j++){
+                await delay(timeout);
                 var sDagVote = await AnthillContract.methods.readSentDagVote(id, dist, depth, j).call();
                 if (sDagVote.id == "0x0000000000000000000000000000000000000000"){
                     continue;
@@ -196,6 +202,7 @@ async function getRecDagVotes(id : string) : Promise<DagVote[]>{
         for (var depth = 0; depth < maxRelRootDepth; depth++) {
             recDagVoteCountString  = await AnthillContract.methods.readRecDagVoteCount(id, dist, depth).call();
             for (var j= 0; j< parseInt(recDagVoteCountString); j++){
+                await delay(timeout);
                 var rDagVote = await AnthillContract.methods.readRecDagVote(id, dist, depth, j).call();
                 if (rDagVote.id == "0x0000000000000000000000000000000000000000"){
                     continue;
@@ -215,7 +222,9 @@ async function getSaveChildren(id: string){
         var sentDagVotes: DagVote[]= await getSentDagVotes(childId);
         var recDagVotes: DagVote[]= await getRecDagVotes(childId);
         var onChainRep = await getAnthillReputation(childId);
+        await delay(timeout);
         var name = await getAnthillName(childId);
+        await delay(timeout);
         var totalWeight = await getAnthillTotalWeight(childId);
 
         var childNode = {"id": childId, "name":name,"totalWeight":totalWeight, "onchainRep":onChainRep, "currentRep": 0, "depth":0, "relRoot": "",  "sentTreeVote": id, "recTreeVotes": [], "sentDagVotes": sentDagVotes, "recDagVotes": recDagVotes} as NodeData;
