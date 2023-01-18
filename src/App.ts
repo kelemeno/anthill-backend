@@ -178,6 +178,7 @@ async function getSentDagVotes(id : string) : Promise<DagVote[]>{
 
     for (var dist =0; dist < maxRelRootDepth; dist++){
         for (var depth = 0; depth < maxRelRootDepth; depth++) {
+            await delay(timeout);
             sentDagVoteCountString  = await AnthillContract.methods.readSentDagVoteCount(id, dist, depth).call();
             for (var j= 0; j < parseInt(sentDagVoteCountString); j++){
                 await delay(timeout);
@@ -200,6 +201,7 @@ async function getRecDagVotes(id : string) : Promise<DagVote[]>{
 
     for (var dist = 0; dist < maxRelRootDepth; dist++) {
         for (var depth = 0; depth < maxRelRootDepth; depth++) {
+            await delay(timeout);
             recDagVoteCountString  = await AnthillContract.methods.readRecDagVoteCount(id, dist, depth).call();
             for (var j= 0; j< parseInt(recDagVoteCountString); j++){
                 await delay(timeout);
