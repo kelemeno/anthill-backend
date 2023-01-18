@@ -96,7 +96,7 @@ function replaceServe(){
 // web3
 var Web3 = require('web3');
 // const providerUrl = "ws://localhost:8545";
-const providerURL = "wss://rpc-mumbai.matic.today"
+const providerURL = "wss://polygon-testnet.blastapi.io/88fd2015-7a3d-4ea1-a72d-34144c92d931"
 // "wss://polygon-mumbai.infura.io/v3/2f35e26bd5094d0e946f38ab603841ed"
 
 
