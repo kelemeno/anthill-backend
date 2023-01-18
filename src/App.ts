@@ -107,7 +107,7 @@ const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // m
 // "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
 // "0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
 var fs = require('fs');
-var jsonFile = "../anthill/out/Anthill.sol/Anthill.json"
+var jsonFile = "./Anthill.json"
 var contract= JSON.parse(fs.readFileSync(jsonFile));
 var AnthillContract = new web3.eth.Contract(contract.abi, anthillContractAddress);
 
