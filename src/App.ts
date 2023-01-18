@@ -169,7 +169,7 @@ async function getAnthillTotalWeight(id: string):Promise<number> {
 function delay(ms: number) {
     return new Promise( resolve => setTimeout(resolve, ms) );
 }
-const timeout=100;
+const timeout=40;
 
 async function getSentDagVotes(id : string) : Promise<DagVote[]>{
     var dagVotes= [];
