@@ -101,7 +101,7 @@ const providerURL = "https://polygon-mumbai.infura.io/v3/2f35e26bd5094d0e946f38a
 var web3 = new Web3(providerURL);
 
 // contract
-const anthillContractAddress = "0x62031Ba7be7C70c00D32ffB2DE46B51752642AD3" // mumbai
+const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai
 // "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
 // "0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
 var fs = require('fs');
