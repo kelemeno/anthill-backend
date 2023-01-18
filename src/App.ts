@@ -96,7 +96,7 @@ function replaceServe(){
 // web3
 var Web3 = require('web3');
 // const providerUrl = "ws://localhost:8545";
-const providerURL = "https://polygon-mumbai.infura.io/v3/2f35e26bd5094d0e946f38ab603841ed"
+const providerURL = "wss://polygon-mumbai.infura.io/v3/2f35e26bd5094d0e946f38ab603841ed"
 
 
 // "https://rpc-mumbai.maticvigil.com/v1/0x62031Ba7be7C70c00D32ffB2DE46B51752642AD3";
