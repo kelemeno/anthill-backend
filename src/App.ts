@@ -95,12 +95,15 @@ function replaceServe(){
 
 // web3
 var Web3 = require('web3');
-const anvilUrl = "ws://localhost:8545";
-var web3 = new Web3(anvilUrl);
+// const providerUrl = "ws://localhost:8545";
+const providerURL = "https://polygon-mumbai.infura.io/v3/2f35e26bd5094d0e946f38ab603841ed"
+// "https://rpc-mumbai.maticvigil.com/v1/0x62031Ba7be7C70c00D32ffB2DE46B51752642AD3";
+var web3 = new Web3(providerURL);
 
 // contract
-const anthillContractAddress = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
-// "0x5fbdb2315678afecb367f032d93f642f64180aa3"
+const anthillContractAddress = "0x62031Ba7be7C70c00D32ffB2DE46B51752642AD3" // mumbai
+// "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
+// "0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
 var fs = require('fs');
 var jsonFile = "../anthill/out/Anthill.sol/Anthill.json"
 var contract= JSON.parse(fs.readFileSync(jsonFile));
