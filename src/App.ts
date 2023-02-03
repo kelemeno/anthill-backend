@@ -47,7 +47,7 @@ app.get("/isNodeInGraph/:id", function(req, res) {
 });  
 
 app.get("/anthillGraphNum", function(req, res) {
-    console.log("getting anthillGraphNum")
+    // console.log("getting anthillGraphNum")
     res.send({"anthillGraphNum": anthillGraphNumServe});
 });   
 
