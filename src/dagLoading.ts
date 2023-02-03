@@ -1,10 +1,18 @@
-import {address0, GraphData, DagVote, NodeDataStore} from "./dagBase";
+import {address0,address1,  GraphData, DagVote, NodeDataStore, GraphDataDict, initialiseDagArray} from "./dagBase";
 
 
-export function resetIntermediate(dag: GraphData, depthA: string[][]){
-    dag = {"rootId": address0} as GraphData;
-    depthA = [[]] as string[][];
+export function resetIntermediate(dag: GraphData) {
+    const emptyDict = {} as GraphDataDict;
+
+    dag.rootId = address0
+    dag.maxRelRootDepth = 6
+    dag.dict = emptyDict;
+    var node1 = {"id":address1, "depth":-1, "relRoot":address1, "sentTreeVote": address1, "recTreeVotes":[], "recDagVotes":[], "sentDagVotes":[], "currentRep":0, "totalWeight":0, "name":"", "reputation":0};
+    dag.dict[address1]  = node1;
+
 }
+
+
 
 async function getAnthillMaxRelRootDepth( AnthillContract: any,): Promise<number>{
     const res = await AnthillContract.methods.readMaxRelRootDepth().call();
@@ -24,21 +32,23 @@ async function getAnthillName(AnthillContract: any, id: string):Promise<string> 
 
 async function getAnthillReputation(AnthillContract: any, id: string):Promise<number> {
     const res = await AnthillContract.methods.readReputation(id).call();
-    return res;
+    return parseInt(res);
 }
 
 async function getAnthillTotalWeight(AnthillContract: any, id: string):Promise<number> {
     const res = await AnthillContract.methods.readSentDagVoteTotalWeight(id).call();
-    return res;
+    return parseInt(res);
 }
 
 function delay(ms: number) {
     return new Promise( resolve => setTimeout(resolve, ms) );
 }
-const timeout=40;
+
+const timeout=40; 
+// const timeout = 0;
 
 export async function getSentDagVotes(maxRelRootDepth:number,AnthillContract: any, id : string) : Promise<DagVote[][][]>{
-    var dagVotes= [[[]]] as DagVote[][][]; ; 
+    var dagVotes= initialiseDagArray(maxRelRootDepth); 
     var sentDagVoteCountString="" ;
 
     for (var dist =0; dist < maxRelRootDepth; dist++){
@@ -51,7 +61,7 @@ export async function getSentDagVotes(maxRelRootDepth:number,AnthillContract: an
                 if (sDagVote.id == address0){
                     continue;
                 }
-                dagVotes[dist][depth].push({"id":sDagVote.id , "weight":sDagVote.weight, "posInOther":sDagVote.posInOther});
+                dagVotes[dist][depth].push({"id":sDagVote.id , "weight":parseInt(sDagVote.weight), "posInOther":parseInt(sDagVote.posInOther)});
             
             }
         }
@@ -60,7 +70,7 @@ export async function getSentDagVotes(maxRelRootDepth:number,AnthillContract: an
 }
 
 export async function getRecDagVotes(maxRelRootDepth:number, AnthillContract: any, id : string) : Promise<DagVote[][][]>{
-    var dagVotes= [[[]]] as DagVote[][][];
+    var dagVotes = initialiseDagArray(maxRelRootDepth);
     var recDagVoteCountString="" ;
 
     for (var dist = 0; dist < maxRelRootDepth; dist++) {
@@ -73,7 +83,8 @@ export async function getRecDagVotes(maxRelRootDepth:number, AnthillContract: an
                 if (rDagVote.id == address0){
                     continue;
                 }
-                dagVotes[dist][depth].push({"id":rDagVote.id , "weight":rDagVote.weight, "posInOther":rDagVote.posInOther});
+                // console.log("dagVotes", dagVotes, dist, depth, dagVotes[dist][depth]);
+                dagVotes[dist][depth].push({"id":rDagVote.id , "weight":parseInt(rDagVote.weight), "posInOther":parseInt(rDagVote.posInOther)});
             }
         }
     }
@@ -93,7 +104,7 @@ export async function getSaveChildren(dag: GraphData, AnthillContract: any, id: 
         await delay(timeout);
         var totalWeight = await getAnthillTotalWeight(AnthillContract, childId);
 
-        var childNode = {"id": childId, "name":name,"totalWeight":totalWeight, "onchainRep":onChainRep, "currentRep": 0, "depth":0, "relRoot": "",  "sentTreeVote": id, "recTreeVotes": [], "sentDagVotes": sentDagVotes, "recDagVotes": recDagVotes} as NodeDataStore;
+        var childNode = {"id": childId, "name":name,"totalWeight":totalWeight,  "currentRep": 0, "depth":0, "relRoot": "",  "sentTreeVote": id, "recTreeVotes": [], "sentDagVotes": sentDagVotes, "recDagVotes": recDagVotes} as NodeDataStore;
         dag.dict[childId] = childNode;
 
         // we push the children here instead of in the childnode initialisation above, as we are already crawling the tree. 
@@ -104,8 +115,9 @@ export async function getSaveChildren(dag: GraphData, AnthillContract: any, id: 
     
 }
 
-export async function loadAnthillGraph(dag: GraphData,depthA:string[][],  anthillGraphNum: number, AnthillContract: any,){
-    resetIntermediate(dag, depthA );
+export async function loadAnthillGraph(dag: GraphData, depthA:string[][],  anthillGraphNum: number, AnthillContract: any,){
+    
+    resetIntermediate(dag);
 
     dag.maxRelRootDepth = await getAnthillMaxRelRootDepth( AnthillContract);
     
@@ -121,8 +133,9 @@ export async function loadAnthillGraph(dag: GraphData,depthA:string[][],  anthil
     var recDagVotes: DagVote[][][]= await getRecDagVotes(dag.maxRelRootDepth, AnthillContract, id);
     var totalWeight = await getAnthillTotalWeight(AnthillContract, id);
 
-    var node = {"id": id, "name": name, "totalWeight":totalWeight, "onchainRep":onChainRep, "currentRep": 0, "depth":0, "relRoot": "", "sentTreeVote": sentTreeVote ,  "recTreeVotes": [], "sentDagVotes": [[[]]],"recDagVotes":recDagVotes} as NodeDataStore;
+    var node = {"id": id, "name": name, "totalWeight":totalWeight, "currentRep": 0, "depth":0, "relRoot": "", "sentTreeVote": sentTreeVote ,  "recTreeVotes": [], "sentDagVotes": initialiseDagArray(dag.maxRelRootDepth) , "recDagVotes":recDagVotes} as NodeDataStore;
     dag.dict[id] = node;
+    dag.dict[address1].recTreeVotes.push(id);
 
     await getSaveChildren(dag, AnthillContract, id);
 

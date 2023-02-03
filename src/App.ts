@@ -1,7 +1,9 @@
 import express from "express";
+import assert from "assert";
+
 // import Quote from 'inspirational-quotes';
 
-import {GraphData, address0, NodeDataStore, DagVote} from "./dagBase";
+import {GraphData, address0, NodeDataStore, DagVote, joinTree, changeName,  addDagVote, removeDagVote, leaveTree, switchPositionWithParent, moveTreeVote} from "./dagBase";
 import {calculateDepthAndRelRoot, calculateReputation, findRandomLeaf} from "./dagProcessing";
 import {loadAnthillGraph} from "./dagLoading";
 
@@ -78,7 +80,6 @@ app.listen(port, function() {
     console.log("Server started successfully");
     console.log("Crawling ethereum for data");
     crawlEthereum();
-    console.log("Finished crawling ethereum for data");
 
 });
 
@@ -104,7 +105,6 @@ function NodeDataStoreCollapse(node:NodeDataStore): NodeData {
 
     nodec.depth = node.depth;
     nodec.currentRep = node.currentRep;
-    nodec.onchainRep = node.onchainRep;
     nodec.relRoot = node.relRoot;
 
     nodec.totalWeight = node.totalWeight;
@@ -140,19 +140,16 @@ function NodeDataStoreCollapse(node:NodeDataStore): NodeData {
 
 // web3
 var Web3 = require('web3');
-// const providerUrl = "ws://localhost:8545";
+// const providerURL = "ws://localhost:8545";
 const providerURL = "wss://polygon-testnet.blastapi.io/88fd2015-7a3d-4ea1-a72d-34144c92d931"
-// "wss://polygon-mumbai.infura.io/v3/2f35e26bd5094d0e946f38ab603841ed"
 
-
-// "https://rpc-mumbai.maticvigil.com/v1/0x62031Ba7be7C70c00D32ffB2DE46B51752642AD3";
 var web3 = new Web3(providerURL);
 
 // contract
 const anthillContractAddress = "0x7b7D7Ea1c6aBA7aa7de1DC8595A9e839B0ee58FB" // mumbai v2. 
-//  "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai
+// const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai v.1
 // const anthillContractAddress = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
-// "0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
+// const anthillContractAddress ="0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
 var fs = require('fs');
 var jsonFile = "./Anthill.json"
 var contract= JSON.parse(fs.readFileSync(jsonFile));
@@ -160,9 +157,9 @@ var AnthillContract = new web3.eth.Contract(contract.abi, anthillContractAddress
 
 
 // types
-export type NodeData = {"id":string, "name":string, "totalWeight":number; "onchainRep":number, "currentRep": number, "depth":number,  "relRoot":string,  "sentTreeVote": string, "recTreeVotes":string[], "sentDagVotes":DagVote[], "recDagVotes": DagVote[]}
+export type NodeData = {"id":string, "name":string, "totalWeight":number;  "currentRep": number, "depth":number,  "relRoot":string,  "sentTreeVote": string, "recTreeVotes":string[], "sentDagVotes":DagVote[], "recDagVotes": DagVote[]}
 
-export type NodeDataBare = {"id":string, "name":string,  "totalWeight":number; "onchainRep":number, "currentRep": number, "depth":number, "relRoot":string, "sentTreeVote": string, "recTreeVotes": string []}
+export type NodeDataBare = {"id":string, "name":string,  "totalWeight":number;  "currentRep": number, "depth":number, "relRoot":string, "sentTreeVote": string, "recTreeVotes": string []}
 
 var anthillGraph = {} as GraphData;
 var anthillGraphByDepth = [[]] as string[][];
@@ -172,25 +169,110 @@ var anthillRootId = address0;
 var randomLeaf =    address0;
 
 async function crawlEthereum() {
+    console.log("loading graph (slowest part)")
     await loadAnthillGraph(anthillGraph, anthillGraphByDepth, anthillGraphNum, AnthillContract)
-
+    console.log("calculating depth")
     calculateDepthAndRelRoot(anthillGraph, anthillGraphByDepth);
+    console.log("calculating reputation")
     calculateReputation(anthillGraph, anthillGraphByDepth);
-    findRandomLeaf(anthillGraph);
+    console.log("finding random leaf")
+    randomLeaf = findRandomLeaf(anthillGraph);
+    console.log("the found random leaf is: ", randomLeaf)
     replaceServe();
 
     // start subscription
     web3.eth.subscribe('logs', {"address": anthillContractAddress},
          async function(error:any, result:any){ 
             if (!error){
+
+                // for testing we copy 
+                // var anthillGraphCopy = (JSON.parse(JSON.stringify(anthillGraph))) as GraphData;
+                // var anthillGraphByDepthCopy = [[]] as string[][]; 
+
+                // assert (deepEqual(anthillGraph, anthillGraphCopy))
+                // console.log("copy sanity check passed")
+
+                // anthillGraphCopy.dict["0x0000000000000000000000000000000000000004"].recDagVotes[0][1][0].posInOther= 7; 
+                // assert (deepEqual(anthillGraph, anthillGraphCopy)==false)
+                // console.log("copy sanity check 2 passed")
+
+                if (result.topics[0] == web3.eth.abi.encodeEventSignature("joinTreeEvent(address,string,address)")){
+                    var {'0' :voter, '1':name, '2': recipient} =web3.eth.abi.decodeParameters(['address', 'string', 'address'], result.data);
+                    console.log("joinTreeEvent", voter, name, recipient)
+                    joinTree(anthillGraph, voter, name, recipient);
+
+                } else if (result.topics[0] == web3.eth.abi.encodeEventSignature("changeNameEvent(address,string)")){
+
+                    var {'0' :voter, '1':newName} =web3.eth.abi.decodeParameters(['address', 'string'], result.data);
+                    console.log("changeNameEvent", voter, newName)
+                    changeName(anthillGraph, voter, newName);
+
+                } else if (result.topics[0] == web3.eth.abi.encodeEventSignature("addDagVoteEvent(address,address,uint32)")){
+
+                    var {'0' :voter, '1':recipient, '2': weight} =web3.eth.abi.decodeParameters(['address', 'address', 'uint32'], result.data);
+                    console.log("addDagVoteEvent", voter, recipient, weight )
+                    addDagVote(anthillGraph, voter, recipient, parseInt(weight));
+
+                } else if (result.topics[0] == web3.eth.abi.encodeEventSignature("removeDagVoteEvent(address,address)")){
+
+                    var {'0' :voter, '1':recipient}  =web3.eth.abi.decodeParameters(['address', 'address'], result.data);
+                    console.log("removeDagVote", voter, recipient)
+                    removeDagVote(anthillGraph, voter, recipient);
+
+                } else if (result.topics[0] == web3.eth.abi.encodeEventSignature("leaveTreeEvent(address)")){
+
+                    var {'0' :voter} =web3.eth.abi.decodeParameters(['address'], result.data);
+                    console.log("leaveTreeEvent", voter)
+                    leaveTree(anthillGraph, voter);
+
+                } else if (result.topics[0] == web3.eth.abi.encodeEventSignature("switchPositionWithParentEvent(address)")){
+
+                    var {'0' :voter} =web3.eth.abi.decodeParameters(['address',], result.data);
+                    console.log("switchPositionWithParentEvent", voter)
+                    switchPositionWithParent(anthillGraph, voter);
+
+                } else if (result.topics[0] == web3.eth.abi.encodeEventSignature("moveTreeVoteEvent(address,address)")){
+
+                    var {'0' :voter, '1': recipient} =web3.eth.abi.decodeParameters(['address', 'address'], result.data);
+                    console.log("moveTreeVoteEvent", voter, recipient)
+                    moveTreeVote(anthillGraph, voter, recipient);
+
+                } 
+
+                anthillGraphByDepth = [[]] as string[][];
+
                 
-                await loadAnthillGraph(anthillGraph, anthillGraphByDepth, anthillGraphNum, AnthillContract);
+                
                 calculateDepthAndRelRoot(anthillGraph, anthillGraphByDepth);
                 calculateReputation(anthillGraph, anthillGraphByDepth);
+                
+                // for testing
+                // await loadAnthillGraph(anthillGraphCopy, anthillGraphByDepthCopy, anthillGraphNum, AnthillContract);
+
+                // calculateDepthAndRelRoot(anthillGraphCopy, anthillGraphByDepthCopy);
+                // calculateReputation(anthillGraphCopy, anthillGraphByDepthCopy);
+
+                // console.log("asserting")
+
+                // console.log( JSON.stringify(anthillGraph))
+                // console.log( JSON.stringify(anthillGraphCopy))
+
+                // assert (deepEqual(anthillGraph, anthillGraphCopy));
+                // console.log("testing assert success")
+                
                 findRandomLeaf(anthillGraph);
+                anthillGraphNum +=1;
 
                 replaceServe();
             } else {console.log("we had some error in the eth subscription!", error)}
         }
     )
 }
+
+function deepEqual(x:any, y:any):boolean {
+    const ok = Object.keys, tx = typeof x, ty = typeof y;
+    return x && y && tx === 'object' && tx === ty ? (
+      ok(x).length === ok(y).length &&
+        ok(x).every(key => deepEqual(x[key], y[key]))
+    ) : (x === y);
+  }

@@ -30,7 +30,7 @@ function calculateDepthAndRelRootInner(dag: GraphData, depthA: string[][],  id:s
 
 export function calculateReputation(dag: GraphData, depthA: string[][]){
   
-    for (var i = depthA.length; i >= 0; i--) {
+    for (var i = depthA.length-1; i >= 0; i--) {
         depthA[i].forEach((id) => {
             var node = dag.dict[id];
             node.currentRep = 10**18;
@@ -49,7 +49,8 @@ export function calculateReputation(dag: GraphData, depthA: string[][]){
 
 export function findRandomLeaf(dag: GraphData):string{
     var nodeId = dag.rootId;
-    // console.log("finding random leaf", nodeId, anthillGraph.dict[nodeId], anthillGraph.dict[nodeId].recTreeVotes)
+
+    // console.log("finding random leaf", nodeId, dag.dict[nodeId], dag.dict[nodeId].recTreeVotes)
     while (dag.dict[nodeId].recTreeVotes.length == 2){
         var rand = Math.floor(Math.random() * 2);
         nodeId = dag.dict[nodeId].recTreeVotes[rand];
