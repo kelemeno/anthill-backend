@@ -143,13 +143,24 @@ var Web3 = require('web3');
 // const providerURL = "ws://localhost:8545";
 const providerURL = "wss://polygon-testnet.blastapi.io/88fd2015-7a3d-4ea1-a72d-34144c92d931"
 
-var web3 = new Web3(providerURL);
+var options = {
+    reconnect: {
+        auto: true,
+        delay: 60000, // ms
+        maxAttempts: 5,
+        onTimeout: false
+    }
+};
+
+var web3 = new Web3(new Web3.providers.WebsocketProvider(providerURL, options));
+// which one? to delete. 
+// var web3 = new Web3(providerURL, options);
 
 // contract
 
 const anthillContractAddress = "0xb2218969ECF92a3085B8345665d65FCdFED9F981" // mumbai v3
-// const anthillContractAddress = "0x7b7D7Ea1c6aBA7aa7de1DC8595A9e839B0ee58FB" // mumbai v2.
-// const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai v.1
+// const anthillContractAddress = "0x7b7D7Ea1c6aBA7aa7de1DC8595A9e839B0ee58FB" // mumbai v2
+// const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai v1
 
 // const anthillContractAddress = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
 // const anthillContractAddress ="0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
