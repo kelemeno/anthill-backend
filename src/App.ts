@@ -201,7 +201,7 @@ var Web3 = require('web3');
 var providerURL : string; 
 var anthillContractAddress: string;
 
-const testing = true;
+const testing = false;
 
 if (testing) {
      providerURL = "ws://localhost:8545";
