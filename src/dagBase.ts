@@ -23,6 +23,7 @@ export function initialiseDagArray(maxRelRootDepth: number): DagVote[][][]{
 
 ///////////////////
 ////// Update
+
 export function joinTree( dag: GraphData ,  voter:string, name: string, recipient: string){
     // todo sanitity check
     if( dag.dict[voter] == undefined) {

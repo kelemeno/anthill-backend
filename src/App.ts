@@ -1,11 +1,18 @@
 import express from "express";
 import assert from "assert";
+import { v4 as uuidv4 } from 'uuid';
+
+
 
 // import Quote from 'inspirational-quotes';
 
 import {GraphData, address0, NodeDataStore, DagVote, joinTree, changeName,  addDagVote, removeDagVote, leaveTree, switchPositionWithParent, moveTreeVote} from "./dagBase";
 import {calculateDepthAndRelRoot, calculateReputation, findRandomLeaf} from "./dagProcessing";
 import {loadAnthillGraph} from "./dagLoading";
+
+import WebSocket, { WebSocketServer as WSWebSocketServer } from 'ws';
+
+const http = require('http');
 
 //////////////////////////////
 ////// serve 
@@ -37,7 +44,7 @@ app.get("/rootId", function(req, res) {
 });
 
 app.get("/isNodeInGraph/:id", function(req, res) {
-    console.log("isNodeInGraph")
+    console.log("isNodeInGraph", req.params.id)
     if (anthillGraphServe.dict[req.params.id] === undefined){
         res.send({"isNodeInGraph": false});
     } else {
@@ -46,10 +53,10 @@ app.get("/isNodeInGraph/:id", function(req, res) {
     
 });  
 
-app.get("/anthillGraphNum", function(req, res) {
-    // console.log("getting anthillGraphNum")
-    res.send({"anthillGraphNum": anthillGraphNumServe});
-});   
+// app.get("/anthillGraphNum", function(req, res) {
+//     // console.log("getting anthillGraphNum")
+//     res.send({"anthillGraphNum": anthillGraphNumServe});
+// });   
 
 app.get("/id/:id", function(req, res) {
     console.log("getting id: ", req.params.id)
@@ -73,15 +80,62 @@ app.get("/randomLeaf", function(req, res) {
 let port = process.env.PORT;
 
 if(port == null || port == "") {
- port = "5000";
+    port = "5000";
 }
 
 app.listen(port, function() {
     console.log("Server started successfully");
-    console.log("Crawling ethereum for data");
-    crawlEthereum();
+    // console.log("Crawling ethereum for data");
+    // crawlEthereum();
 
 });
+
+/////////////////////////////////////////
+
+// Spinning the http server and the WebSocket server.
+
+const server = http.createServer();
+const WebSocketServer = WebSocket.Server || WSWebSocketServer;
+const wsServer = new WebSocketServer({ server });
+
+let wsport = process.env.PORT;
+
+if(wsport == null || wsport == "") {
+    wsport = "8000";
+}
+
+server.listen(wsport, () => {
+    console.log(`WebSocket server is running on port ${wsport}`);
+    crawlEthereum();
+});
+
+
+// I'm maintaining all active connections in this object
+var clients : {[id : string] : string} ={} ;
+
+// A new client connection request received
+wsServer.on('connection', function connection(ws:any, req: any) {
+
+    // Generate a unique code for every user
+    const userId = uuidv4();
+    console.log(`Recieved a new connection.`);
+
+    // Store the new connection and handle messages
+    clients[userId] = ws;
+    ws.uid = userId;
+
+    console.log(`${userId} connected.`);
+
+    ws.on('message', function incoming(message:any) {
+        console.log('received: %s', message);
+    })
+
+    ws.send("Hello from the server");
+});
+
+
+
+/////////////////////////////////////////
 
 var anthillGraphServe = {} as GraphData;
 var anthillGraphNumServe =0;
@@ -96,6 +150,10 @@ function replaceServe(){
     anthillGraphNumServe = anthillGraphNum;
     anthillRootIdServe = anthillRootId;
     randomLeafServe = randomLeaf;
+
+    wsServer.clients.forEach((client:any) => {
+        client.send("update");
+    });
 }
 
 function NodeDataStoreCollapse(node:NodeDataStore): NodeData {
@@ -140,8 +198,27 @@ function NodeDataStoreCollapse(node:NodeDataStore): NodeData {
 
 // web3
 var Web3 = require('web3');
-// const providerURL = "ws://localhost:8545";
-const providerURL = "wss://polygon-testnet.blastapi.io/88fd2015-7a3d-4ea1-a72d-34144c92d931"
+var providerURL : string; 
+var anthillContractAddress: string;
+
+const testing = true;
+
+if (testing) {
+     providerURL = "ws://localhost:8545";
+
+     anthillContractAddress = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
+    // const anthillContractAddress ="0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
+
+} else {
+    providerURL = "wss://polygon-testnet.blastapi.io/88fd2015-7a3d-4ea1-a72d-34144c92d931"
+
+     anthillContractAddress = "0xb2218969ECF92a3085B8345665d65FCdFED9F981" // mumbai v3
+    // const anthillContractAddress = "0x7b7D7Ea1c6aBA7aa7de1DC8595A9e839B0ee58FB" // mumbai v2
+    // const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai v1
+}
+
+
+
 
 var options = {
     reconnect: {
@@ -153,17 +230,10 @@ var options = {
 };
 
 var web3 = new Web3(new Web3.providers.WebsocketProvider(providerURL, options));
-// which one? to delete. 
-// var web3 = new Web3(providerURL, options);
 
 // contract
 
-const anthillContractAddress = "0xb2218969ECF92a3085B8345665d65FCdFED9F981" // mumbai v3
-// const anthillContractAddress = "0x7b7D7Ea1c6aBA7aa7de1DC8595A9e839B0ee58FB" // mumbai v2
-// const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai v1
 
-// const anthillContractAddress = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
-// const anthillContractAddress ="0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
 var fs = require('fs');
 var jsonFile = "./Anthill.json"
 var contract= JSON.parse(fs.readFileSync(jsonFile));
@@ -283,10 +353,11 @@ async function crawlEthereum() {
     )
 }
 
-function deepEqual(x:any, y:any):boolean {
-    const ok = Object.keys, tx = typeof x, ty = typeof y;
-    return x && y && tx === 'object' && tx === ty ? (
-      ok(x).length === ok(y).length &&
-        ok(x).every(key => deepEqual(x[key], y[key]))
-    ) : (x === y);
-  }
+// used for testing 
+// function deepEqual(x:any, y:any):boolean {
+//     const ok = Object.keys, tx = typeof x, ty = typeof y;
+//     return x && y && tx === 'object' && tx === ty ? (
+//       ok(x).length === ok(y).length &&
+//         ok(x).every(key => deepEqual(x[key], y[key]))
+//     ) : (x === y);
+//   }
