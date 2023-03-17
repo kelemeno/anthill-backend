@@ -10,9 +10,10 @@ import {GraphData, address0, NodeDataStore, DagVote, joinTree, changeName,  addD
 import {calculateDepthAndRelRoot, calculateReputation, findRandomLeaf} from "./dagProcessing";
 import {loadAnthillGraph} from "./dagLoading";
 
-import WebSocket, { WebSocketServer as WSWebSocketServer } from 'ws';
+// import WebSocket, { WebSocketServer as WSWebSocketServer } from 'ws';
 
 const http = require('http');
+const {Server} = require('ws');
 
 //////////////////////////////
 ////// serve 
@@ -83,22 +84,26 @@ if(port == null || port == "") {
     port = "5000";
 }
 
-app.listen(port, function() {
-    console.log("Server started successfully");
-    // console.log("Crawling ethereum for data");
-    // crawlEthereum();
+// app.listen(port, function() {
+//     console.log("Server started successfully");
+//     // console.log("Crawling ethereum for data");
+//     // crawlEthereum();
 
-});
+// });
 
 /////////////////////////////////////////
 
 // Spinning the http server and the WebSocket server.
 
-const server = http.createServer({trustProxy: true});
-const WebSocketServer = WebSocket.Server || WSWebSocketServer;
-const wsServer = new WebSocketServer({ server: server, clientTracking: true });
+// const server = http.createServer({trustProxy: true});
+// const WebSocketServer = WebSocket.Server || WSWebSocketServer;
+// const wsServer = new WebSocketServer({ server: server, clientTracking: true });
 
-let wsport = process.env.WS_PORT;
+
+const server = express()
+const wsServer = new Server({ server });
+
+let wsport = process.env.PORT;
 
 if(wsport == null || wsport == "") {
     wsport = "8080";
