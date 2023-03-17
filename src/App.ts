@@ -84,12 +84,12 @@ if(port == null || port == "") {
     port = "5000";
 }
 
-// app.listen(port, function() {
-//     console.log("Server started successfully");
-//     // console.log("Crawling ethereum for data");
-//     // crawlEthereum();
+app.listen(port, function() {
+    console.log("Server started successfully");
+    // console.log("Crawling ethereum for data");
+    // crawlEthereum();
 
-// });
+});
 
 /////////////////////////////////////////
 
@@ -99,11 +99,9 @@ const server = http.createServer({trustProxy: true});
 // const WebSocketServer = WebSocket.Server || WSWebSocketServer;
 // const wsServer = new WebSocketServer({ server: server, clientTracking: true });
 
-
-// const server = express()
 const wsServer = new Server({ server });
 
-let wsport = process.env.PORT;
+let wsport = process.env.WS_PORT;
 
 if(wsport == null || wsport == "") {
     wsport = "8080";
