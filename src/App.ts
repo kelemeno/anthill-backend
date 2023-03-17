@@ -95,12 +95,12 @@ if(port == null || port == "") {
 
 // Spinning the http server and the WebSocket server.
 
-// const server = http.createServer({trustProxy: true});
+const server = http.createServer({trustProxy: true});
 // const WebSocketServer = WebSocket.Server || WSWebSocketServer;
 // const wsServer = new WebSocketServer({ server: server, clientTracking: true });
 
 
-const server = express()
+// const server = express()
 const wsServer = new Server({ server });
 
 let wsport = process.env.PORT;
