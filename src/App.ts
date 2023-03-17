@@ -94,9 +94,9 @@ app.listen(port, function() {
 
 // Spinning the http server and the WebSocket server.
 
-const server = http.createServer();
+const server = http.createServer({trustProxy: true});
 const WebSocketServer = WebSocket.Server || WSWebSocketServer;
-const wsServer = new WebSocketServer({ server });
+const wsServer = new WebSocketServer({ server: server, clientTracking: true });
 
 let wsport = process.env.WS_PORT;
 
