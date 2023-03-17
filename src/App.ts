@@ -101,7 +101,7 @@ const wsServer = new WebSocketServer({ server: server, clientTracking: true });
 let wsport = process.env.WS_PORT;
 
 if(wsport == null || wsport == "") {
-    wsport = "8000";
+    wsport = "8080";
 }
 
 server.listen(wsport, () => {
