@@ -98,7 +98,7 @@ const server = http.createServer();
 const WebSocketServer = WebSocket.Server || WSWebSocketServer;
 const wsServer = new WebSocketServer({ server });
 
-let wsport = process.env.PORT;
+let wsport = process.env.WS_PORT;
 
 if(wsport == null || wsport == "") {
     wsport = "8000";
