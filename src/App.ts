@@ -15,9 +15,56 @@ import {loadAnthillGraph} from "./dagLoading";
 const http = require('http');
 const {Server} = require('ws');
 
+
+/////////////////////////////////////////
+
+// Spinning the http exress server and the WebSocket server on the same port.
+const app = express();
+
+const server = http.createServer(app, {trustProxy: true});
+// const WebSocketServer = WebSocket.Server || WSWebSocketServer;
+// const wsServer = new WebSocketServer({ server: server, clientTracking: true });
+
+const wsServer = new Server({ server });
+
+let port = process.env.PORT;
+
+if(port == null || port == "") {
+    port = "5000";
+}
+
+server.listen(port, () => {
+    console.log(`WebSocket and http server is running on port ${port}`);
+    crawlEthereum();
+});
+
+
+// I'm maintaining all active connections in this object
+var clients : {[id : string] : string} ={} ;
+
+// A new client connection request received
+wsServer.on('connection', function connection(ws:any, req: any) {
+
+    // Generate a unique code for every user
+    const userId = uuidv4();
+    console.log(`Recieved a new connection.`);
+
+    // Store the new connection and handle messages
+    clients[userId] = ws;
+    ws.uid = userId;
+
+    console.log(`${userId} connected.`);
+
+    ws.on('message', function incoming(message:any) {
+        console.log('received: %s', message);
+    })
+
+    ws.send("Hello from the server");
+});
+
+
 //////////////////////////////
 ////// serve 
-const app = express();
 
 app.use(function(req, res, next) {
   res.header('Access-Control-Allow-Origin', '*');
@@ -78,63 +125,20 @@ app.get("/randomLeaf", function(req, res) {
     res.send({"randomLeaf":randomLeafServe});
 });
 
-let port = process.env.PORT;
+// let port = process.env.PORT;
 
-if(port == null || port == "") {
-    port = "5000";
-}
+// if(port == null || port == "") {
+//     port = "5000";
+// }
 
-app.listen(port, function() {
-    console.log("Server started successfully");
-    // console.log("Crawling ethereum for data");
-    // crawlEthereum();
+// // using the same port as ws, so redundunt
+// app.listen(port, function() {
+//     console.log("Server started successfully");
+//     // console.log("Crawling ethereum for data");
+//     // crawlEthereum();
 
-});
+// });
 
-/////////////////////////////////////////
-
-// Spinning the http server and the WebSocket server.
-
-const server = http.createServer({trustProxy: true});
-// const WebSocketServer = WebSocket.Server || WSWebSocketServer;
-// const wsServer = new WebSocketServer({ server: server, clientTracking: true });
-
-const wsServer = new Server({ server });
-
-let wsport = process.env.WS_PORT;
-
-if(wsport == null || wsport == "") {
-    wsport = "8080";
-}
-
-server.listen(wsport, () => {
-    console.log(`WebSocket server is running on port ${wsport}`);
-    crawlEthereum();
-});
-
-
-// I'm maintaining all active connections in this object
-var clients : {[id : string] : string} ={} ;
-
-// A new client connection request received
-wsServer.on('connection', function connection(ws:any, req: any) {
-
-    // Generate a unique code for every user
-    const userId = uuidv4();
-    console.log(`Recieved a new connection.`);
-
-    // Store the new connection and handle messages
-    clients[userId] = ws;
-    ws.uid = userId;
-
-    console.log(`${userId} connected.`);
-
-    ws.on('message', function incoming(message:any) {
-        console.log('received: %s', message);
-    })
-
-    ws.send("Hello from the server");
-});
 
 
 
