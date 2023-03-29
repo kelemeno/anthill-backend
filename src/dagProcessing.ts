@@ -51,9 +51,9 @@ export function findRandomLeaf(dag: GraphData):string{
     var nodeId = dag.rootId;
 
     // console.log("finding random leaf", nodeId, dag.dict[nodeId], dag.dict[nodeId].recTreeVotes)
-    while (dag.dict[nodeId].recTreeVotes.length == 2){
-        var rand = Math.floor(Math.random() * 2);
-        nodeId = dag.dict[nodeId].recTreeVotes[rand];
+    while (dag.dict[nodeId].recTreeVotes.length > 0){
+        var rand = Math.floor(Math.random() * dag.dict[nodeId].recTreeVotes.length);
+        nodeId = dag.dict[nodeId].recTreeVotes[rand];   
     }
     return nodeId;
 }

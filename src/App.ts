@@ -35,7 +35,7 @@ if(port == null || port == "") {
 
 server.listen(port, () => {
     console.log(`WebSocket and http server is running on port ${port}`);
-    crawlEthereum();
+    crawlEthereum(testing);
 });
 
 
@@ -108,7 +108,11 @@ app.get("/isNodeInGraph/:id", function(req, res) {
 
 app.get("/id/:id", function(req, res) {
     console.log("getting id: ", req.params.id)
-    res.send({"nodeData":NodeDataStoreCollapse(anthillGraphServe.dict[req.params.id])});
+    if ((req.params.id === "undefined") || (req.params.id === undefined) || (anthillGraphServe.dict[req.params.id] === undefined)){
+        res.status(404).send({ message: 'User not found' });
+    } else {
+        res.send({"nodeData":NodeDataStoreCollapse(anthillGraphServe.dict[req.params.id])});
+    }
 });
 
 app.get("/bareId/:id", function(req, res) {
@@ -219,7 +223,8 @@ if (testing) {
 } else {
     providerURL = "wss://polygon-testnet.blastapi.io/88fd2015-7a3d-4ea1-a72d-34144c92d931"
 
-     anthillContractAddress = "0xb2218969ECF92a3085B8345665d65FCdFED9F981" // mumbai v3
+    anthillContractAddress = "0x69649a6E7E9c090a742f0671C64f4c7c31a1e4ce" // mumbai v4
+    // anthillContractAddress = "0xb2218969ECF92a3085B8345665d65FCdFED9F981" // mumbai v3
     // const anthillContractAddress = "0x7b7D7Ea1c6aBA7aa7de1DC8595A9e839B0ee58FB" // mumbai v2
     // const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai v1
 }
@@ -259,9 +264,9 @@ var maxRelRootDepth = 6;
 var anthillRootId = address0;
 var randomLeaf =    address0;
 
-async function crawlEthereum() {
+async function crawlEthereum(testing: boolean) {
     console.log("loading graph (slowest part)")
-    await loadAnthillGraph(anthillGraph, anthillGraphByDepth, anthillGraphNum, AnthillContract)
+    await loadAnthillGraph(anthillGraph, anthillGraphByDepth, anthillGraphNum, AnthillContract, testing)
     console.log("calculating depth")
     calculateDepthAndRelRoot(anthillGraph, anthillGraphByDepth);
     console.log("calculating reputation")

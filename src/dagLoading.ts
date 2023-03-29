@@ -44,10 +44,9 @@ function delay(ms: number) {
     return new Promise( resolve => setTimeout(resolve, ms) );
 }
 
-const timeout=40; 
-// const timeout = 0;
 
-export async function getSentDagVotes(maxRelRootDepth:number,AnthillContract: any, id : string) : Promise<DagVote[][][]>{
+
+export async function getSentDagVotes(maxRelRootDepth:number,AnthillContract: any, id : string, timeout:number) : Promise<DagVote[][][]>{
     var dagVotes= initialiseDagArray(maxRelRootDepth); 
     var sentDagVoteCountString="" ;
 
@@ -69,7 +68,7 @@ export async function getSentDagVotes(maxRelRootDepth:number,AnthillContract: an
     return dagVotes;
 }
 
-export async function getRecDagVotes(maxRelRootDepth:number, AnthillContract: any, id : string) : Promise<DagVote[][][]>{
+export async function getRecDagVotes(maxRelRootDepth:number, AnthillContract: any, id : string, timeout:number) : Promise<DagVote[][][]>{
     var dagVotes = initialiseDagArray(maxRelRootDepth);
     var recDagVoteCountString="" ;
 
@@ -91,13 +90,13 @@ export async function getRecDagVotes(maxRelRootDepth:number, AnthillContract: an
     return dagVotes;
 }
 
-export async function getSaveChildren(dag: GraphData, AnthillContract: any, id: string){
+export async function getSaveChildren(dag: GraphData, AnthillContract: any, id: string, timeout:number){
     var childCount  = await AnthillContract.methods.readRecTreeVoteCount(id).call();
     for (var i = 0; i < childCount; i++) {
         var childId = (await AnthillContract.methods.readRecTreeVote(id, i).call());
 
-        var sentDagVotes: DagVote[][][]= await getSentDagVotes(dag.maxRelRootDepth, AnthillContract, childId);
-        var recDagVotes: DagVote[][][]= await getRecDagVotes(dag.maxRelRootDepth, AnthillContract, childId);
+        var sentDagVotes: DagVote[][][]= await getSentDagVotes(dag.maxRelRootDepth, AnthillContract, childId, timeout);
+        var recDagVotes: DagVote[][][]= await getRecDagVotes(dag.maxRelRootDepth, AnthillContract, childId, timeout);
         var onChainRep = await getAnthillReputation(AnthillContract, childId);
         await delay(timeout);
         var name = await getAnthillName(AnthillContract, childId);
@@ -110,13 +109,15 @@ export async function getSaveChildren(dag: GraphData, AnthillContract: any, id: 
         // we push the children here instead of in the childnode initialisation above, as we are already crawling the tree. 
         dag.dict[id].recTreeVotes.push(childId);
 
-        await getSaveChildren(dag, AnthillContract, childId);
+        await getSaveChildren(dag, AnthillContract, childId, timeout);
     }
     
 }
 
-export async function loadAnthillGraph(dag: GraphData, depthA:string[][],  anthillGraphNum: number, AnthillContract: any,){
-    
+export async function loadAnthillGraph(dag: GraphData, depthA:string[][],  anthillGraphNum: number, AnthillContract: any,testing:boolean){
+    var timeout=40;
+    if (testing) {timeout = 0}; 
+
     resetIntermediate(dag);
 
     dag.maxRelRootDepth = await getAnthillMaxRelRootDepth( AnthillContract);
@@ -130,13 +131,13 @@ export async function loadAnthillGraph(dag: GraphData, depthA:string[][],  anthi
     var name = await getAnthillName(AnthillContract, id);
     var sentTreeVote = await AnthillContract.methods.readSentTreeVote(id).call();
     // the root has no sentDagVotes, so we don't read that.  
-    var recDagVotes: DagVote[][][]= await getRecDagVotes(dag.maxRelRootDepth, AnthillContract, id);
+    var recDagVotes: DagVote[][][]= await getRecDagVotes(dag.maxRelRootDepth, AnthillContract, id, timeout);
     var totalWeight = await getAnthillTotalWeight(AnthillContract, id);
 
     var node = {"id": id, "name": name, "totalWeight":totalWeight, "currentRep": 0, "depth":0, "relRoot": "", "sentTreeVote": sentTreeVote ,  "recTreeVotes": [], "sentDagVotes": initialiseDagArray(dag.maxRelRootDepth) , "recDagVotes":recDagVotes} as NodeDataStore;
     dag.dict[id] = node;
     dag.dict[address1].recTreeVotes.push(id);
 
-    await getSaveChildren(dag, AnthillContract, id);
+    await getSaveChildren(dag, AnthillContract, id, timeout);
 
 }
