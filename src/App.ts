@@ -3,14 +3,9 @@ import assert from "assert";
 import { v4 as uuidv4 } from 'uuid';
 
 
-
-// import Quote from 'inspirational-quotes';
-
 import {GraphData, address0, NodeDataStore, DagVote, joinTree, changeName,  addDagVote, removeDagVote, leaveTree, switchPositionWithParent, moveTreeVote} from "./dagBase";
 import {calculateDepthAndRelRoot, calculateReputation, findRandomLeaf} from "./dagProcessing";
 import {loadAnthillGraph} from "./dagLoading";
-
-// import WebSocket, { WebSocketServer as WSWebSocketServer } from 'ws';
 
 const http = require('http');
 const {Server} = require('ws');
@@ -22,28 +17,25 @@ const {Server} = require('ws');
 const app = express();
 
 const server = http.createServer(app, {trustProxy: true});
-// const WebSocketServer = WebSocket.Server || WSWebSocketServer;
-// const wsServer = new WebSocketServer({ server: server, clientTracking: true });
-
 const wsServer = new Server({ server });
 
 let port = process.env.PORT;
 
 if(port == null || port == "") {
-    port = "5000";
+  port = "5000";
 }
 
 server.listen(port, () => {
-    console.log(`WebSocket and http server is running on port ${port}`);
-    crawlEthereum(testing);
+  console.log(`WebSocket and http server is running on port ${port}`);
+  crawlEthereum(testing);
 });
 
 
 // I'm maintaining all active connections in this object
-var clients : {[id : string] : string} ={} ;
+var clients : {[id : string] : WebSocket} ={} ;
 
 // A new client connection request received
-wsServer.on('connection', function connection(ws:any, req: any) {
+wsServer.on('connection', function connection(ws) {
 
     // Generate a unique code for every user
     const userId = uuidv4();
@@ -55,157 +47,47 @@ wsServer.on('connection', function connection(ws:any, req: any) {
 
     console.log(`${userId} connected.`);
 
-    ws.on('message', function incoming(message:any) {
+    ws.on('message', function incoming(message) {
         console.log('received: %s', message);
     })
 
-    ws.send("Hello from the server");
+    ws.send(JSON.stringify({
+        anthillGraph: anthillGraphServe, 
+        anthillGraphNum: anthillGraphNumServe,
+        anthillRootId: anthillRootIdServe,
+        randomLeaf: randomLeafServe
+    }));
 });
-
 
 //////////////////////////////
-////// serve 
 
-app.use(function(req, res, next) {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-  next();
-});
-
-app.use((err:any, req:any, res:any, next:any) => {
-    res.locals.error = err.response.data;
-    const status = err.status || 500;
-    res.status(status);
-    res.render('error');
-});
-
-
-app.get("/maxRelRootDepth", function(req, res) {
-    console.log("getting max rel root");
-    res.send({"maxRelRootDepth": maxRelRootDepth});
-    
-});
-
-app.get("/rootId", function(req, res) {
-    console.log("getting root")
-    res.send({"id":anthillRootIdServe});
-});
-
-app.get("/isNodeInGraph/:id", function(req, res) {
-    console.log("isNodeInGraph", req.params.id)
-    if (anthillGraphServe.dict[req.params.id] === undefined){
-        res.send({"isNodeInGraph": false});
-    } else {
-        res.send({"isNodeInGraph": true});
-    }
-    
-});  
-
-// app.get("/anthillGraphNum", function(req, res) {
-//     // console.log("getting anthillGraphNum")
-//     res.send({"anthillGraphNum": anthillGraphNumServe});
-// });   
-
-app.get("/id/:id", function(req, res) {
-    console.log("getting id: ", req.params.id)
-    if ((req.params.id === "undefined") || (req.params.id === undefined) || (anthillGraphServe.dict[req.params.id] === undefined)){
-        res.status(404).send({ message: 'User not found' });
-    } else {
-        res.send({"nodeData":NodeDataStoreCollapse(anthillGraphServe.dict[req.params.id])});
-    }
-});
-
-app.get("/bareId/:id", function(req, res) {
-    console.log("getting bare id: ", req.params.id)
-    // console.log("displaying: ", anthillGraphServe[req.params.id])
-    var nodeData = anthillGraphServe.dict[req.params.id]
-    
-    res.send({"nodeData":nodeData as NodeDataBare});
-});
-
-app.get("/randomLeaf", function(req, res) {
-    console.log("getting random leaf")
-    
-    res.send({"randomLeaf":randomLeafServe});
-});
-
-// let port = process.env.PORT;
-
-// if(port == null || port == "") {
-//     port = "5000";
-// }
-
-// // using the same port as ws, so redundunt
-// app.listen(port, function() {
-//     console.log("Server started successfully");
-//     // console.log("Crawling ethereum for data");
-//     // crawlEthereum();
-
-// });
-
-
-
-
-/////////////////////////////////////////
-
-var anthillGraphServe = {} as GraphData;
-var anthillGraphNumServe =0;
+var anthillGraphServe = {} as GraphData;  
+var anthillGraphNumServe =0;    
 
 var anthillRootIdServe = address0;
 var randomLeafServe = address0;
 
 
+function broadcastState() {
+  wsServer.clients.forEach((client:any) => {
+      client.send(JSON.stringify({
+        anthillGraph: anthillGraphServe, 
+        anthillGraphNum: anthillGraphNumServe,
+        anthillRootId: anthillRootIdServe,
+        randomLeaf: randomLeafServe
+      }));
+  });
+}
+
 function replaceServe(){
 
-    anthillGraphServe = anthillGraph;
-    anthillGraphNumServe = anthillGraphNum;
-    anthillRootIdServe = anthillRootId;
-    randomLeafServe = randomLeaf;
+  anthillGraphServe = anthillGraph;
+  anthillGraphNumServe = anthillGraphNum;
+  anthillRootIdServe = anthillRootId;
+  randomLeafServe = randomLeaf;
 
-    wsServer.clients.forEach((client:any) => {
-        client.send("update");
-    });
+  broadcastState();
 }
-
-function NodeDataStoreCollapse(node:NodeDataStore): NodeData {
-    var nodec = {} as NodeData;
-    nodec.id = node.id;
-    nodec.name = node.name;
-
-    nodec.depth = node.depth;
-    nodec.currentRep = node.currentRep;
-    nodec.relRoot = node.relRoot;
-
-    nodec.totalWeight = node.totalWeight;
-    nodec.sentTreeVote = node.sentTreeVote;
-    nodec.recTreeVotes = node.recTreeVotes;
-
-    nodec.sentDagVotes = [] as DagVote[];
-    nodec.recDagVotes = [] as DagVote[];
-
-    node.recDagVotes.forEach((rDagVoteAA) => {
-        rDagVoteAA.forEach((rDagVoteA) => {
-            rDagVoteA.forEach((rDagVote) => {
-                nodec.recDagVotes.push(rDagVote);
-            })
-        })
-    });
-    
-    node.sentDagVotes.forEach((sDagVoteAA) => {
-        sDagVoteAA.forEach((sDagVoteA) => {
-            sDagVoteA.forEach((sDagVote) => {
-                nodec.sentDagVotes.push(sDagVote);
-            })
-        })
-    });
-
-    return nodec
-}
-
-
-//////////////////////
-///// Load 
-
 
 // web3
 var Web3 = require('web3');
@@ -228,9 +110,6 @@ if (testing) {
     // const anthillContractAddress = "0x7b7D7Ea1c6aBA7aa7de1DC8595A9e839B0ee58FB" // mumbai v2
     // const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai v1
 }
-
-
-
 
 var options = {
     reconnect: {
