@@ -30,7 +30,7 @@ const wsServer = new Server({ server });
 let port = process.env.PORT;
 
 if(port == null || port == "") {
-    port = "5000";
+    port = "5001";
 }
 
 server.listen(port, () => {
@@ -132,7 +132,7 @@ app.get("/randomLeaf", function(req, res) {
 // let port = process.env.PORT;
 
 // if(port == null || port == "") {
-//     port = "5000";
+//     port = "5001";
 // }
 
 // // using the same port as ws, so redundunt
@@ -212,25 +212,26 @@ var Web3 = require('web3');
 var providerURL : string; 
 var anthillContractAddress: string;
 
-const testing = false;
+const testing = true;
 
 if (testing) {
-     providerURL = "ws://localhost:8545";
+    //  providerURL = "ws://localhost:8545";
+     providerURL = "ws://localhost:3051"; // zksync test node
 
-     anthillContractAddress = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
+     anthillContractAddress = "0x4B5DF730c2e6b28E17013A1485E5d9BC41Efe021" // zk forge with lib
+    //  anthillContractAddress = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
     // const anthillContractAddress ="0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
 
 } else {
     providerURL = "wss://polygon-testnet.blastapi.io/88fd2015-7a3d-4ea1-a72d-34144c92d931"
+    providerURL  = "wss://sepolia.era.zksync.dev/ws"
 
-    anthillContractAddress = "0x69649a6E7E9c090a742f0671C64f4c7c31a1e4ce" // mumbai v4
+    anthillContractAddress = "0xb15E953512462DB4d3458Eb1669F102d03ef0C8F"; // zksync sepolia
+    // anthillContractAddress = "0x69649a6E7E9c090a742f0671C64f4c7c31a1e4ce" // mumbai v4
     // anthillContractAddress = "0xb2218969ECF92a3085B8345665d65FCdFED9F981" // mumbai v3
     // const anthillContractAddress = "0x7b7D7Ea1c6aBA7aa7de1DC8595A9e839B0ee58FB" // mumbai v2
     // const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai v1
 }
-
-
-
 
 var options = {
     reconnect: {
@@ -265,15 +266,15 @@ var anthillRootId = address0;
 var randomLeaf =    address0;
 
 async function crawlEthereum(testing: boolean) {
-    console.log("loading graph (slowest part)")
+    console.log("Loading graph (slowest part)")
     await loadAnthillGraph(anthillGraph, anthillGraphByDepth, anthillGraphNum, AnthillContract, testing)
-    console.log("calculating depth")
+    console.log("Calculating depth")
     calculateDepthAndRelRoot(anthillGraph, anthillGraphByDepth);
-    console.log("calculating reputation")
+    console.log("Calculating reputation")
     calculateReputation(anthillGraph, anthillGraphByDepth);
-    console.log("finding random leaf")
+    console.log("Finding random leaf")
     randomLeaf = findRandomLeaf(anthillGraph);
-    console.log("the found random leaf is: ", randomLeaf)
+    console.log("The found random leaf is: ", randomLeaf)
     replaceServe();
 
     // start subscription

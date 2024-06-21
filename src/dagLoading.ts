@@ -91,6 +91,7 @@ export async function getRecDagVotes(maxRelRootDepth:number, AnthillContract: an
 }
 
 export async function getSaveChildren(dag: GraphData, AnthillContract: any, id: string, timeout:number){
+    console.log("Getting voter with address: " + id)
     var childCount  = await AnthillContract.methods.readRecTreeVoteCount(id).call();
     for (var i = 0; i < childCount; i++) {
         var childId = (await AnthillContract.methods.readRecTreeVote(id, i).call());
@@ -121,12 +122,13 @@ export async function loadAnthillGraph(dag: GraphData, depthA:string[][],  anthi
     resetIntermediate(dag);
 
     dag.maxRelRootDepth = await getAnthillMaxRelRootDepth( AnthillContract);
-    
-    anthillGraphNum +=1;
 
+    console.log("MaxRelRootDepth is: " + dag.maxRelRootDepth);
+    anthillGraphNum +=1;
+    
     var id : string= (await getAnthillRootId(dag, AnthillContract));
     dag.rootId = id;
-    console.log("root is: " + id);
+    console.log("Root is: " + id);
     var onChainRep = await getAnthillReputation(AnthillContract, id);
     var name = await getAnthillName(AnthillContract, id);
     var sentTreeVote = await AnthillContract.methods.readSentTreeVote(id).call();
