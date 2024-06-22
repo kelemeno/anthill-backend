@@ -8,7 +8,8 @@
     "start:dev": "npx nodemon",
     "build": "rimraf ./build && tsc",
     "start": "node build/App.js",
-    "postinstall": "tsc"
+    "postinstall": "tsc",
+    "fix": "prettier --write \"**/*.{js,json,md,sol,ts,tsx,yaml}\""
   },
   "build": "rimraf ./build && tsc",
   "compilerOptions": {
@@ -20,6 +21,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "inspirational-quotes": "^2.0.1",
+    "prettier": "^3.3.2",
     "uuid": "^9.0.0",
     "web3": "^1.8.1"
   },
