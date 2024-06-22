@@ -364,7 +364,7 @@ async function crawlEthereum(testing: boolean) {
         } else if (
           result.topics[0] ==
           web3.eth.abi.encodeEventSignature(
-            "AddDagVoteEvent(address,address,uint32)",
+            "AddDagVoteEvent(address,address,uint256)",
           )
         ) {
           var {
@@ -372,7 +372,7 @@ async function crawlEthereum(testing: boolean) {
             "1": recipient,
             "2": weight,
           } = web3.eth.abi.decodeParameters(
-            ["address", "address", "uint32"],
+            ["address", "address", "uint256"],
             result.data,
           );
           console.log("addDagVoteEvent", voter, recipient, weight);
