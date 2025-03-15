@@ -9,6 +9,7 @@ import {
   address0,
   NodeDataStore,
   DagVote,
+  DagVoteString,
   joinTree,
   changeName,
   addDagVote,
@@ -16,6 +17,7 @@ import {
   leaveTree,
   switchPositionWithParent,
   moveTreeVote,
+  dagVoteString,
 } from "./dagBase";
 import {
   calculateDepthAndRelRoot,
@@ -23,6 +25,8 @@ import {
   findRandomLeaf,
 } from "./dagProcessing";
 import { loadAnthillGraph } from "./dagLoading";
+import { Anthill__factory } from "./typechain";
+import { ethers, JsonRpcApiProviderOptions } from "ethers";
 
 // import WebSocket, { WebSocketServer as WSWebSocketServer } from 'ws';
 
@@ -181,26 +185,26 @@ function replaceServe() {
   });
 }
 
-function NodeDataStoreCollapse(node: NodeDataStore): NodeData {
-  var nodec = {} as NodeData;
+function NodeDataStoreCollapse(node: NodeDataStore): NodeDataString {
+  var nodec = {} as NodeDataString;
   nodec.id = node.id;
   nodec.name = node.name;
 
   nodec.depth = node.depth;
-  nodec.currentRep = node.currentRep;
+  nodec.currentRep = node.currentRep.toString();
   nodec.relRoot = node.relRoot;
 
-  nodec.totalWeight = node.totalWeight;
+  nodec.totalWeight = node.totalWeight.toString();
   nodec.sentTreeVote = node.sentTreeVote;
   nodec.recTreeVotes = node.recTreeVotes;
 
-  nodec.sentDagVotes = [] as DagVote[];
-  nodec.recDagVotes = [] as DagVote[];
+  nodec.sentDagVotes = [] as DagVoteString[];
+  nodec.recDagVotes = [] as DagVoteString[];
 
   node.recDagVotes.forEach((rDagVoteAA) => {
     rDagVoteAA.forEach((rDagVoteA) => {
       rDagVoteA.forEach((rDagVote) => {
-        nodec.recDagVotes.push(rDagVote);
+        nodec.recDagVotes.push(dagVoteString(rDagVote));
       });
     });
   });
@@ -208,7 +212,7 @@ function NodeDataStoreCollapse(node: NodeDataStore): NodeData {
   node.sentDagVotes.forEach((sDagVoteAA) => {
     sDagVoteAA.forEach((sDagVoteA) => {
       sDagVoteA.forEach((sDagVote) => {
-        nodec.sentDagVotes.push(sDagVote);
+        nodec.sentDagVotes.push(dagVoteString(sDagVote));
       });
     });
   });
@@ -220,56 +224,49 @@ function NodeDataStoreCollapse(node: NodeDataStore): NodeData {
 ///// Load
 
 // web3
-var Web3 = require("web3");
 var providerURL: string;
 var anthillContractAddress: string;
 
-const testing = false;
+const testing = true;
 
 if (testing) {
-  //  providerURL = "ws://localhost:8545";
-  providerURL = "ws://127.0.0.1:3051"; // zksync test node
+   providerURL = "ws://localhost:8545";
+  // providerURL = "ws://127.0.0.1:3051"; // zksync test node
 
-  anthillContractAddress = "0x111C3E89Ce80e62EE88318C2804920D4c96f92bb"; // zk forge with lib
+  // anthillContractAddress = "0x111C3E89Ce80e62EE88318C2804920D4c96f92bb"; // zk forge with lib
   //  anthillContractAddress = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
-  // const anthillContractAddress ="0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
+  anthillContractAddress ="0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
 } else {
   providerURL = "wss://sepolia.era.zksync.dev/ws";
 
   anthillContractAddress = "0xe42923350EF3a534f84bb101453D9B442d42Bf0c"; // zksync sepolia
-  // anthillContractAddress = "0x69649a6E7E9c090a742f0671C64f4c7c31a1e4ce" // mumbai v4
-  // anthillContractAddress = "0xb2218969ECF92a3085B8345665d65FCdFED9F981" // mumbai v3
-  // const anthillContractAddress = "0x7b7D7Ea1c6aBA7aa7de1DC8595A9e839B0ee58FB" // mumbai v2
-  // const anthillContractAddress = "0xE2C8d9C92eAb868C6078C778f12f794858147947" // mumbai v1
 }
 
-var options = {
-  reconnect: {
-    auto: true,
-    delay: 60000, // ms
-    maxAttempts: 5,
-    onTimeout: false,
-  },
+const options: JsonRpcApiProviderOptions = {
+  polling: true,
+  staticNetwork: null,
+  batchStallTime: 60000, // ms
+  batchMaxSize: 5,
+  cacheTimeout: 60000,
+  pollingInterval: 60000
 };
 
-var web3 = new Web3(new Web3.providers.WebsocketProvider(providerURL, options));
+// var web3 = new Web3(new Web3.providers.WebsocketProvider(providerURL, options));
+const webSocketProvider = new ethers.WebSocketProvider(providerURL,undefined, options);
 
 // contract
 
-var fs = require("fs");
-var jsonFile = "./Anthill.json";
-var contract = JSON.parse(fs.readFileSync(jsonFile));
-var AnthillContract = new web3.eth.Contract(
-  contract.abi,
+let AnthillContract = Anthill__factory.connect(
   anthillContractAddress,
+  webSocketProvider
 );
 
 // types
 export type NodeData = {
   id: string;
   name: string;
-  totalWeight: number;
-  currentRep: number;
+  totalWeight: bigint;
+  currentRep: bigint;
   depth: number;
   relRoot: string;
   sentTreeVote: string;
@@ -278,11 +275,24 @@ export type NodeData = {
   recDagVotes: DagVote[];
 };
 
+export type NodeDataString = {
+  id: string;
+  name: string;
+  totalWeight: string;
+  currentRep: string;
+  depth: number;
+  relRoot: string;
+  sentTreeVote: string;
+  recTreeVotes: string[];
+  sentDagVotes: DagVoteString[];
+  recDagVotes: DagVoteString[];
+};
+
 export type NodeDataBare = {
   id: string;
   name: string;
-  totalWeight: number;
-  currentRep: number;
+  totalWeight: bigint;
+  currentRep: bigint;
   depth: number;
   relRoot: string;
   sentTreeVote: string;
@@ -315,13 +325,15 @@ async function crawlEthereum(testing: boolean) {
   replaceServe();
 
   // start subscription
-  web3.eth.subscribe(
-    "logs",
-    { address: anthillContractAddress },
-    async function (error: any, result: any) {
+  webSocketProvider.on(
+    {
+      address: anthillContractAddress,
+      topics: []
+    },
+    async (log) => {
       console.log("received something");
 
-      if (!error) {
+      if (log) {
         console.log("received a non error");
 
         // for testing we copy
@@ -336,91 +348,90 @@ async function crawlEthereum(testing: boolean) {
         // console.log("copy sanity check 2 passed")
 
         if (
-          result.topics[0] ==
-          web3.eth.abi.encodeEventSignature(
-            "JoinTreeEvent(address,string,address)",
+          log.topics[0] ==
+          ethers.id(
+            "JoinTreeEvent(address,string,address)"
           )
         ) {
-          var {
-            "0": voter,
-            "1": name,
-            "2": recipient,
-          } = web3.eth.abi.decodeParameters(
+          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
             ["address", "string", "address"],
-            result.data,
+            log.data
           );
+          const [voter, name, recipient] = decodedData;
           console.log("joinTreeEvent", voter, name, recipient);
           joinTree(anthillGraph, voter, name, recipient);
         } else if (
-          result.topics[0] ==
-          web3.eth.abi.encodeEventSignature("ChangeNameEvent(address,string)")
+          log.topics[0] ==
+          ethers.id("ChangeNameEvent(address,string)")
         ) {
-          var { "0": voter, "1": newName } = web3.eth.abi.decodeParameters(
+          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
             ["address", "string"],
-            result.data,
+            log.data
           );
+          const [voter, newName] = decodedData;
           console.log("changeNameEvent", voter, newName);
           changeName(anthillGraph, voter, newName);
         } else if (
-          result.topics[0] ==
-          web3.eth.abi.encodeEventSignature(
-            "AddDagVoteEvent(address,address,uint256)",
+          log.topics[0] ==
+          ethers.id(
+            "AddDagVoteEvent(address,address,uint256)"
           )
         ) {
-          var {
-            "0": voter,
-            "1": recipient,
-            "2": weight,
-          } = web3.eth.abi.decodeParameters(
+          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
             ["address", "address", "uint256"],
-            result.data,
+            log.data
           );
+          const [voter, recipient, weight] = decodedData;
           console.log("addDagVoteEvent", voter, recipient, weight);
-          addDagVote(anthillGraph, voter, recipient, parseInt(weight));
+          addDagVote(anthillGraph, voter, recipient, weight);
         } else if (
-          result.topics[0] ==
-          web3.eth.abi.encodeEventSignature(
-            "RemoveDagVoteEvent(address,address)",
+          log.topics[0] ==
+          ethers.id(
+            "RemoveDagVoteEvent(address,address)"
           )
         ) {
-          var { "0": voter, "1": recipient } = web3.eth.abi.decodeParameters(
+          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
             ["address", "address"],
-            result.data,
+            log.data
           );
+          const [voter, recipient] = decodedData;
           console.log("removeDagVote", voter, recipient);
           removeDagVote(anthillGraph, voter, recipient);
         } else if (
-          result.topics[0] ==
-          web3.eth.abi.encodeEventSignature("LeaveTreeEvent(address)")
+          log.topics[0] ==
+          ethers.id("LeaveTreeEvent(address)")
         ) {
-          var { "0": voter } = web3.eth.abi.decodeParameters(
+          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
             ["address"],
-            result.data,
+            log.data
           );
+          const [voter] = decodedData;
           console.log("leaveTreeEvent", voter);
           leaveTree(anthillGraph, voter);
         } else if (
-          result.topics[0] ==
-          web3.eth.abi.encodeEventSignature(
-            "SwitchPositionWithParentEvent(address)",
+          log.topics[0] ==
+          ethers.id(
+            "SwitchPositionWithParentEvent(address)"
           )
         ) {
-          var { "0": voter } = web3.eth.abi.decodeParameters(
+          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
             ["address"],
-            result.data,
+            log.data
           );
+          const [voter] = decodedData;
           console.log("switchPositionWithParentEvent", voter);
           switchPositionWithParent(anthillGraph, voter);
         } else if (
-          result.topics[0] ==
-          web3.eth.abi.encodeEventSignature(
-            "MoveTreeVoteEvent(address,address)",
+          log.topics[0] ==
+          ethers.id(
+            "MoveTreeVoteEvent(address,address)"
           )
         ) {
-          var { "0": voter, "1": recipient } = web3.eth.abi.decodeParameters(
+          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
             ["address", "address"],
-            result.data,
+            log.data
           );
+          const [voter, recipient] = decodedData;
           console.log("moveTreeVoteEvent", voter, recipient);
           moveTreeVote(anthillGraph, voter, recipient);
         }
@@ -449,7 +460,7 @@ async function crawlEthereum(testing: boolean) {
 
         replaceServe();
       } else {
-        console.log("we had some error in the eth subscription!", error);
+        console.log("we had some error in the eth subscription!", log.error);
       }
     },
   );

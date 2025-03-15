@@ -3,12 +3,18 @@
 
 import assert from "assert";
 
-export type DagVote = { id: string; weight: number; posInOther: number };
+export type DagVote = { id: string; weight: bigint; dist: number; posInOther: number };
+export type DagVoteString = { id: string; weight: string; dist: number; posInOther: number };
+
+export function dagVoteString(dagVote: DagVote): DagVoteString {
+  return { id: dagVote.id, weight: dagVote.weight.toString(), dist: dagVote.dist, posInOther: dagVote.posInOther };
+}
+
 export type NodeDataStore = {
   id: string;
   name: string;
-  totalWeight: number;
-  currentRep: number;
+  totalWeight: bigint;
+  currentRep: bigint;
   depth: number;
   relRoot: string;
   sentTreeVote: string;
@@ -52,8 +58,8 @@ export function joinTree(
   dag.dict[voter] = {
     id: voter,
     name: name,
-    totalWeight: 0,
-    currentRep: 0,
+    totalWeight: 0n,
+    currentRep: 0n,
     depth: 0,
     relRoot: voter,
     sentTreeVote: recipient,
@@ -67,7 +73,7 @@ export function joinTree(
   dag.dict[voter].name = name;
   dag.dict[voter].id = voter;
 
-  addDagVote(dag, voter, recipient, 1);
+  addDagVote(dag, voter, recipient, 1n);
 }
 
 export function changeName(dag: GraphData, voter: string, newName: string) {
@@ -80,7 +86,7 @@ export function addDagVote(
   dag: GraphData,
   voter: string,
   recipient: string,
-  weight: number,
+  weight: bigint,
 ) {
   // todo sanity check
   var [, dist, depth] = findDistDepth(dag, voter, recipient);
@@ -635,7 +641,7 @@ function combinedDagAppendSDist(
   recipient: string,
   sdist: number,
   depth: number,
-  weight: number,
+  weight: bigint,
 ) {
   var rdist = sdist - depth;
 
@@ -646,12 +652,14 @@ function combinedDagAppendSDist(
     id: recipient,
     weight: weight,
     posInOther: rLen,
+    dist: sdist
   });
   dag.dict[voter].totalWeight += weight;
   dag.dict[recipient].recDagVotes[rdist][depth].push({
     id: voter,
     weight: weight,
     posInOther: sLen,
+    dist: rdist
   });
 }
 

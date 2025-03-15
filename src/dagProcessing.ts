@@ -36,7 +36,7 @@ export function calculateReputation(dag: GraphData, depthA: string[][]) {
   for (var i = depthA.length - 1; i >= 0; i--) {
     depthA[i].forEach((id) => {
       var node = dag.dict[id];
-      node.currentRep = 10 ** 18;
+      node.currentRep = 10n ** 18n;
 
       node.recDagVotes.forEach((rDagVoteAA) => {
         rDagVoteAA.forEach((rDagVoteA) => {

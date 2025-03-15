@@ -7,6 +7,7 @@ import {
   GraphDataDict,
   initialiseDagArray,
 } from "./dagBase";
+import { Anthill } from "./typechain";
 
 export function resetIntermediate(dag: GraphData) {
   const emptyDict = {} as GraphDataDict;
@@ -22,53 +23,12 @@ export function resetIntermediate(dag: GraphData) {
     recTreeVotes: [],
     recDagVotes: [],
     sentDagVotes: [],
-    currentRep: 0,
-    totalWeight: 0,
+    currentRep: 0n,
+    totalWeight: 0n,
     name: "",
-    reputation: 0,
+    reputation: 0n,
   };
   dag.dict[address1] = node1;
-}
-
-async function getAnthillMaxRelRootDepth(
-  AnthillContract: any,
-): Promise<number> {
-  const res = await AnthillContract.methods.readMaxRelRootDepth().call();
-  return res;
-}
-
-async function getAnthillRootId(
-  dag: GraphData,
-  AnthillContract: any,
-): Promise<string> {
-  const res = await AnthillContract.methods.readRoot().call();
-  return res;
-}
-
-async function getAnthillName(
-  AnthillContract: any,
-  id: string,
-): Promise<string> {
-  const res = await AnthillContract.methods.readName(id).call();
-  return res;
-}
-
-async function getAnthillReputation(
-  AnthillContract: any,
-  id: string,
-): Promise<number> {
-  const res = await AnthillContract.methods.readReputation(id).call();
-  return parseInt(res);
-}
-
-async function getAnthillTotalWeight(
-  AnthillContract: any,
-  id: string,
-): Promise<number> {
-  const res = await AnthillContract.methods
-    .readSentDagVoteTotalWeight(id)
-    .call();
-  return parseInt(res);
 }
 
 function delay(ms: number) {
@@ -77,34 +37,28 @@ function delay(ms: number) {
 
 export async function getSentDagVotes(
   maxRelRootDepth: number,
-  AnthillContract: any,
+  AnthillContract: Anthill,
   id: string,
   timeout: number,
 ): Promise<DagVote[][][]> {
   var dagVotes = initialiseDagArray(maxRelRootDepth);
-  var sentDagVoteCountString = "";
 
   await delay(timeout);
-  sentDagVoteCountString = await AnthillContract.methods
-    .readSentDagVoteCount(id, 0, 0)
-    .call();
-  for (var j = 0; j < parseInt(sentDagVoteCountString); j++) {
+  let sentDagVoteCount = await AnthillContract.sentDagVoteCount(id);
+  for (var j = 0; j < sentDagVoteCount; j++) {
     await delay(timeout);
-    var sDagVote = await AnthillContract.methods
-      .readSentDagVote(id, 0, 0, j)
-      .call();
+    var sDagVote = await AnthillContract.sentDagVote(id, j);
     if (sDagVote.id == address0) {
       continue;
     }
-    var rDagVote = await AnthillContract.methods
-      .readRecDagVote(sDagVote.id, 0, 0, sDagVote.posInOther)
-      .call();
-    const dist = parseInt(sDagVote.dist);
-    const depth = dist - parseInt(rDagVote.dist);
+    var rDagVote = await AnthillContract.recDagVote(sDagVote.id, sDagVote.posInOther);
+    const dist = Number(sDagVote.dist);
+    const depth = dist - Number(rDagVote.dist);
     dagVotes[dist][depth].push({
       id: sDagVote.id,
-      weight: parseInt(sDagVote.weight),
-      posInOther: parseInt(sDagVote.posInOther),
+      weight: sDagVote.weight,
+      dist: Number(sDagVote.dist),
+      posInOther: Number(sDagVote.posInOther),
     });
   }
 
@@ -113,37 +67,28 @@ export async function getSentDagVotes(
 
 export async function getRecDagVotes(
   maxRelRootDepth: number,
-  AnthillContract: any,
+  AnthillContract: Anthill,
   id: string,
   timeout: number,
 ): Promise<DagVote[][][]> {
-  var dagVotes = initialiseDagArray(maxRelRootDepth);
-  var recDagVoteCountString = "";
+  let dagVotes = initialiseDagArray(maxRelRootDepth);
 
   await delay(timeout);
-  recDagVoteCountString = await AnthillContract.methods
-    .readRecDagVoteCount(id, 0, 0)
-    .call();
-  for (var j = 0; j < parseInt(recDagVoteCountString); j++) {
+  let recDagVoteCount = await AnthillContract.recDagVoteCount(id);
+  for (var j = 0; j < recDagVoteCount; j++) {
     await delay(timeout);
-    var rDagVote = await AnthillContract.methods
-      .readRecDagVote(id, 0, 0, j)
-      .call();
+    var rDagVote = await AnthillContract.recDagVote(id, j);
+
     if (rDagVote.id == address0) {
       continue;
     }
-    // console.log("dagVotes", dagVotes, dist, depth, dagVotes[dist][depth]);
-    var sDagVote = await AnthillContract.methods
-      .readSentDagVote(rDagVote.id, 0, 0, rDagVote.posInOther)
-      .call();
-    // console.log("sDagVote", sDagVote, rDagVote)
-    const dist = parseInt(rDagVote.dist);
-    const depth = parseInt(sDagVote.dist) - dist;
-    // console.log(dist, depth, sDagVote, rDagVote)
-    dagVotes[dist][depth].push({
+    let sDagVote = await AnthillContract.sentDagVote(rDagVote.id, rDagVote.posInOther);
+    const depth = Number(sDagVote.dist) - Number(rDagVote.dist);
+    dagVotes[Number(sDagVote.dist)][depth].push({
       id: rDagVote.id,
-      weight: parseInt(rDagVote.weight),
-      posInOther: parseInt(rDagVote.posInOther),
+      weight: rDagVote.weight,
+      posInOther: Number(rDagVote.posInOther),
+      dist: Number(sDagVote.dist),
     });
   }
 
@@ -152,16 +97,14 @@ export async function getRecDagVotes(
 
 export async function getSaveChildren(
   dag: GraphData,
-  AnthillContract: any,
+  AnthillContract: Anthill,
   id: string,
   timeout: number,
 ) {
   console.log("Getting voter with address: " + id);
-  var childCount = await AnthillContract.methods
-    .readRecTreeVoteCount(id)
-    .call();
+  var childCount = await AnthillContract.recTreeVoteCount(id);
   for (var i = 0; i < childCount; i++) {
-    var childId = await AnthillContract.methods.readRecTreeVote(id, i).call();
+    var childId = await AnthillContract.recTreeVote(id, i);
 
     var sentDagVotes: DagVote[][][] = await getSentDagVotes(
       dag.maxRelRootDepth,
@@ -175,17 +118,17 @@ export async function getSaveChildren(
       childId,
       timeout,
     );
-    var onChainRep = await getAnthillReputation(AnthillContract, childId);
+    var onChainRep = await AnthillContract.calculatedReputationForEpoch(childId);
     await delay(timeout);
-    var name = await getAnthillName(AnthillContract, childId);
+    var name = await AnthillContract.nameOf(childId);
     await delay(timeout);
-    var totalWeight = await getAnthillTotalWeight(AnthillContract, childId);
+    var totalWeight = await AnthillContract.sentDagVoteTotalWeight(childId);
 
     var childNode = {
       id: childId,
       name: name,
       totalWeight: totalWeight,
-      currentRep: 0,
+      currentRep: 0n,
       depth: 0,
       relRoot: "",
       sentTreeVote: id,
@@ -206,7 +149,7 @@ export async function loadAnthillGraph(
   dag: GraphData,
   depthA: string[][],
   anthillGraphNum: number,
-  AnthillContract: any,
+  AnthillContract: Anthill,
   testing: boolean,
 ) {
   var timeout = 40;
@@ -216,17 +159,17 @@ export async function loadAnthillGraph(
 
   resetIntermediate(dag);
 
-  dag.maxRelRootDepth = await getAnthillMaxRelRootDepth(AnthillContract);
+  dag.maxRelRootDepth = Number(await AnthillContract.MAX_REL_ROOT_DEPTH());
 
   console.log("MaxRelRootDepth is: " + dag.maxRelRootDepth);
   anthillGraphNum += 1;
 
-  var id: string = await getAnthillRootId(dag, AnthillContract);
+  var id: string = await AnthillContract.root();
   dag.rootId = id;
   console.log("Root is: " + id);
-  var onChainRep = await getAnthillReputation(AnthillContract, id);
-  var name = await getAnthillName(AnthillContract, id);
-  var sentTreeVote = await AnthillContract.methods.readSentTreeVote(id).call();
+  var onChainRep = await AnthillContract.calculatedReputationForEpoch(id);
+  var name = await AnthillContract.nameOf(id);
+  var sentTreeVote = await AnthillContract.sentTreeVote(id);
   // the root has no sentDagVotes, so we don't read that.
   var recDagVotes: DagVote[][][] = await getRecDagVotes(
     dag.maxRelRootDepth,
@@ -234,13 +177,13 @@ export async function loadAnthillGraph(
     id,
     timeout,
   );
-  var totalWeight = await getAnthillTotalWeight(AnthillContract, id);
+  var totalWeight = await AnthillContract.sentDagVoteTotalWeight(id);
 
   var node = {
     id: id,
     name: name,
     totalWeight: totalWeight,
-    currentRep: 0,
+    currentRep: 0n,
     depth: 0,
     relRoot: "",
     sentTreeVote: sentTreeVote,
