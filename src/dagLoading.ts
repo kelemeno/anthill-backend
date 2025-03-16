@@ -4,8 +4,7 @@ import {
   GraphData,
   DagVote,
   NodeDataStore,
-  GraphDataDict,
-  initialiseDagArray,
+  GraphDataDict
 } from "./dagBase";
 import { Anthill } from "./typechain";
 
@@ -40,8 +39,8 @@ export async function getSentDagVotes(
   AnthillContract: Anthill,
   id: string,
   timeout: number,
-): Promise<DagVote[][][]> {
-  var dagVotes = initialiseDagArray(maxRelRootDepth);
+): Promise<DagVote[]> {
+  var dagVotes: DagVote[] = [];
 
   await delay(timeout);
   let sentDagVoteCount = await AnthillContract.sentDagVoteCount(id);
@@ -54,7 +53,7 @@ export async function getSentDagVotes(
     var rDagVote = await AnthillContract.recDagVote(sDagVote.id, sDagVote.posInOther);
     const dist = Number(sDagVote.dist);
     const depth = dist - Number(rDagVote.dist);
-    dagVotes[dist][depth].push({
+    dagVotes.push({
       id: sDagVote.id,
       weight: sDagVote.weight,
       dist: Number(sDagVote.dist),
@@ -70,8 +69,8 @@ export async function getRecDagVotes(
   AnthillContract: Anthill,
   id: string,
   timeout: number,
-): Promise<DagVote[][][]> {
-  let dagVotes = initialiseDagArray(maxRelRootDepth);
+): Promise<DagVote[]> {
+  var dagVotes: DagVote[] = [];
 
   await delay(timeout);
   let recDagVoteCount = await AnthillContract.recDagVoteCount(id);
@@ -83,8 +82,7 @@ export async function getRecDagVotes(
       continue;
     }
     let sDagVote = await AnthillContract.sentDagVote(rDagVote.id, rDagVote.posInOther);
-    const depth = Number(sDagVote.dist) - Number(rDagVote.dist);
-    dagVotes[Number(sDagVote.dist)][depth].push({
+    dagVotes.push({
       id: rDagVote.id,
       weight: rDagVote.weight,
       posInOther: Number(rDagVote.posInOther),
@@ -106,13 +104,13 @@ export async function getSaveChildren(
   for (var i = 0; i < childCount; i++) {
     var childId = await AnthillContract.recTreeVote(id, i);
 
-    var sentDagVotes: DagVote[][][] = await getSentDagVotes(
+    var sentDagVotes: DagVote[] = await getSentDagVotes(
       dag.maxRelRootDepth,
       AnthillContract,
       childId,
       timeout,
     );
-    var recDagVotes: DagVote[][][] = await getRecDagVotes(
+    var recDagVotes: DagVote[] = await getRecDagVotes(
       dag.maxRelRootDepth,
       AnthillContract,
       childId,
@@ -171,7 +169,7 @@ export async function loadAnthillGraph(
   var name = await AnthillContract.nameOf(id);
   var sentTreeVote = await AnthillContract.sentTreeVote(id);
   // the root has no sentDagVotes, so we don't read that.
-  var recDagVotes: DagVote[][][] = await getRecDagVotes(
+  var recDagVotes: DagVote[] = await getRecDagVotes(
     dag.maxRelRootDepth,
     AnthillContract,
     id,
@@ -188,7 +186,7 @@ export async function loadAnthillGraph(
     relRoot: "",
     sentTreeVote: sentTreeVote,
     recTreeVotes: [],
-    sentDagVotes: initialiseDagArray(dag.maxRelRootDepth),
+    sentDagVotes: [],
     recDagVotes: recDagVotes,
   } as NodeDataStore;
   dag.dict[id] = node;

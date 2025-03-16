@@ -201,20 +201,12 @@ function NodeDataStoreCollapse(node: NodeDataStore): NodeDataString {
   nodec.sentDagVotes = [] as DagVoteString[];
   nodec.recDagVotes = [] as DagVoteString[];
 
-  node.recDagVotes.forEach((rDagVoteAA) => {
-    rDagVoteAA.forEach((rDagVoteA) => {
-      rDagVoteA.forEach((rDagVote) => {
-        nodec.recDagVotes.push(dagVoteString(rDagVote));
-      });
-    });
+  node.recDagVotes.forEach((rDagVote) => {
+    nodec.recDagVotes.push(dagVoteString(rDagVote));
   });
 
-  node.sentDagVotes.forEach((sDagVoteAA) => {
-    sDagVoteAA.forEach((sDagVoteA) => {
-      sDagVoteA.forEach((sDagVote) => {
-        nodec.sentDagVotes.push(dagVoteString(sDagVote));
-      });
-    });
+  node.sentDagVotes.forEach((sDagVote) => {
+    nodec.sentDagVotes.push(dagVoteString(sDagVote));
   });
 
   return nodec;
@@ -390,22 +382,20 @@ async function crawlEthereum(testing: boolean) {
             "RemoveDagVoteEvent(address,address)"
           )
         ) {
-          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
+          const [voter, recipient]= ethers.AbiCoder.defaultAbiCoder().decode(
             ["address", "address"],
             log.data
           );
-          const [voter, recipient] = decodedData;
           console.log("removeDagVote", voter, recipient);
           removeDagVote(anthillGraph, voter, recipient);
         } else if (
           log.topics[0] ==
           ethers.id("LeaveTreeEvent(address)")
         ) {
-          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
+          const [voter] = ethers.AbiCoder.defaultAbiCoder().decode(
             ["address"],
             log.data
           );
-          const [voter] = decodedData;
           console.log("leaveTreeEvent", voter);
           leaveTree(anthillGraph, voter);
         } else if (

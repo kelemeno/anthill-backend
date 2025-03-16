@@ -38,14 +38,10 @@ export function calculateReputation(dag: GraphData, depthA: string[][]) {
       var node = dag.dict[id];
       node.currentRep = 10n ** 18n;
 
-      node.recDagVotes.forEach((rDagVoteAA) => {
-        rDagVoteAA.forEach((rDagVoteA) => {
-          rDagVoteA.forEach((rDagVote) => {
-            var voter = dag.dict[rDagVote.id];
-            node.currentRep +=
-              (rDagVote.weight * voter.currentRep) / voter.totalWeight;
-          });
-        });
+      node.recDagVotes.forEach((rDagVote) => {
+        var voter = dag.dict[rDagVote.id];
+        node.currentRep +=
+          (rDagVote.weight * voter.currentRep) / voter.totalWeight;
       });
     });
   }
