@@ -143,7 +143,7 @@ app.get("/bareId/:id", function (req, res) {
   // console.log("displaying: ", anthillGraphServe[req.params.id])
   var nodeData = anthillGraphServe.dict[req.params.id];
 
-  res.send({ nodeData: nodeData as NodeDataBare });
+  res.send({ nodeData: NodeDataBareCollapse(nodeData) });
 });
 
 app.get("/randomLeaf", function (req, res) {
@@ -290,6 +290,30 @@ export type NodeDataBare = {
   sentTreeVote: string;
   recTreeVotes: string[];
 };
+
+export type NodeDataBareString = {
+  id: string;
+  name: string;
+  totalWeight: string;
+  currentRep: string;
+  depth: number;
+  relRoot: string;
+  sentTreeVote: string;
+  recTreeVotes: string[];
+};
+
+function NodeDataBareCollapse(node: NodeDataBare): NodeDataBareString {
+  var nodec = {} as NodeDataBareString;
+  nodec.id = node.id;
+  nodec.name = node.name;
+  nodec.totalWeight = node.totalWeight.toString();
+  nodec.currentRep = node.currentRep.toString();
+  nodec.depth = node.depth;
+  nodec.relRoot = node.relRoot;
+  nodec.sentTreeVote = node.sentTreeVote;
+  nodec.recTreeVotes = node.recTreeVotes;
+  return nodec;
+}
 
 var anthillGraph = {} as GraphData;
 var anthillGraphByDepth = [[]] as string[][];
