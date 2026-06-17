@@ -1,4 +1,4 @@
-import { GraphData, address0, NodeDataStore, DagVote } from "./dagBase";
+import type { GraphData } from "./dagBase";
 
 //////////////
 ///// Process

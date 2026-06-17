@@ -3,11 +3,26 @@
 
 import assert from "assert";
 
-export type DagVote = { id: string; weight: bigint; dist: number; posInOther: number };
-export type DagVoteString = { id: string; weight: string; dist: number; posInOther: number };
+export type DagVote = {
+  id: string;
+  weight: bigint;
+  dist: number;
+  posInOther: number;
+};
+export type DagVoteString = {
+  id: string;
+  weight: string;
+  dist: number;
+  posInOther: number;
+};
 
 export function dagVoteString(dagVote: DagVote): DagVoteString {
-  return { id: dagVote.id, weight: dagVote.weight.toString(), dist: dagVote.dist, posInOther: dagVote.posInOther };
+  return {
+    id: dagVote.id,
+    weight: dagVote.weight.toString(),
+    dist: dagVote.dist,
+    posInOther: dagVote.posInOther,
+  };
 }
 
 export type NodeDataStore = {
@@ -273,7 +288,7 @@ function handleLeavingVoterBranch(dag: GraphData, voter: string) {
 function handleDagVoteReplace(
   dag: GraphData,
   voterWithChangingDagVotes: string,
-  recipient: string, 
+  recipient: string,
   replacedPositionInTree: string,
   moveDist: number,
   heightToRec: number,
@@ -291,36 +306,50 @@ function handleDagVoteReplace(
       currentRep: 0n,
       depth: 0,
       relRoot: temp,
-      name: ""
+      name: "",
     };
     addTreeVote(dag, temp, recipient);
     replacedPositionInTree = temp;
   }
 
   // Handle sent votes
-  for (let i = dag.dict[voterWithChangingDagVotes].sentDagVotes.length; 0 < i; --i) {
-    const sDagVote = dag.dict[voterWithChangingDagVotes].sentDagVotes[i-1];
-    const [isLocal, sDist, rDist] = findDistDepth(dag, replacedPositionInTree, sDagVote.id);
-    
-    if (!isLocal || (sDist == rDist)) {
-      safeRemoveSentDagVoteDistDepthPos(dag, voterWithChangingDagVotes, i-1);
-      continue;
+  for (
+    let i = dag.dict[voterWithChangingDagVotes].sentDagVotes.length;
+    0 < i;
+    --i
+  ) {
+    const sDagVote = dag.dict[voterWithChangingDagVotes].sentDagVotes[i - 1];
+    const [isLocal, sDist, rDist] = findDistDepth(
+      dag,
+      replacedPositionInTree,
+      sDagVote.id,
+    );
+
+    if (!isLocal || sDist == rDist) {
+      safeRemoveSentDagVoteDistDepthPos(dag, voterWithChangingDagVotes, i - 1);
     } else {
-      dag.dict[voterWithChangingDagVotes].sentDagVotes[i-1].dist = sDist;
+      dag.dict[voterWithChangingDagVotes].sentDagVotes[i - 1].dist = sDist;
       dag.dict[sDagVote.id].recDagVotes[sDagVote.posInOther].dist = rDist;
     }
   }
 
-  // Handle received votes  
-  for (let i = dag.dict[voterWithChangingDagVotes].recDagVotes.length; 0 < i; --i) {
-    const rDagVote = dag.dict[voterWithChangingDagVotes].recDagVotes[i-1];
-    const [isLocal, sDist, rDist] = findDistDepth(dag, rDagVote.id, replacedPositionInTree);
+  // Handle received votes
+  for (
+    let i = dag.dict[voterWithChangingDagVotes].recDagVotes.length;
+    0 < i;
+    --i
+  ) {
+    const rDagVote = dag.dict[voterWithChangingDagVotes].recDagVotes[i - 1];
+    const [isLocal, sDist, rDist] = findDistDepth(
+      dag,
+      rDagVote.id,
+      replacedPositionInTree,
+    );
 
-    if (!isLocal || (sDist == rDist)) {
-      safeRemoveRecDagVoteDistDepthPos(dag, voterWithChangingDagVotes, i-1);
-      continue;
+    if (!isLocal || sDist == rDist) {
+      safeRemoveRecDagVoteDistDepthPos(dag, voterWithChangingDagVotes, i - 1);
     } else {
-      dag.dict[voterWithChangingDagVotes].recDagVotes[i-1].dist = rDist;
+      dag.dict[voterWithChangingDagVotes].recDagVotes[i - 1].dist = rDist;
       dag.dict[rDagVote.id].sentDagVotes[rDagVote.posInOther].dist = sDist;
     }
   }
@@ -345,9 +374,7 @@ function unsafeReplaceSentDagVoteAtDistDepthPosWithLast(
   if (sPos != dag.dict[voter].sentDagVotes.length - 1) {
     // if we delete a vote in the middle, we need to copy the last vote to the deleted position
     var copiedSentDagVote =
-      dag.dict[voter].sentDagVotes[
-        dag.dict[voter].sentDagVotes.length - 1
-      ];
+      dag.dict[voter].sentDagVotes[dag.dict[voter].sentDagVotes.length - 1];
     dag.dict[voter].sentDagVotes[sPos] = copiedSentDagVote;
     dag.dict[copiedSentDagVote.id].recDagVotes[
       copiedSentDagVote.posInOther
@@ -385,11 +412,7 @@ function safeRemoveSentDagVoteDistDepthPos(
   sPos: number,
 ) {
   var sDagVote = dag.dict[voter].sentDagVotes[sPos];
-  unsafeReplaceSentDagVoteAtDistDepthPosWithLast(
-    dag,
-    voter,
-    sPos,
-  );
+  unsafeReplaceSentDagVoteAtDistDepthPosWithLast(dag, voter, sPos);
   // delete the opposite
   unsafeReplaceRecDagVoteAtDistDepthPosWithLast(
     dag,
@@ -404,11 +427,7 @@ function safeRemoveRecDagVoteDistDepthPos(
   rPos: number,
 ) {
   var rDagVote = dag.dict[recipient].recDagVotes[rPos];
-  unsafeReplaceRecDagVoteAtDistDepthPosWithLast(
-    dag,
-    recipient,
-    rPos,
-  );
+  unsafeReplaceRecDagVoteAtDistDepthPosWithLast(dag, recipient, rPos);
   // delete the opposite
   unsafeReplaceSentDagVoteAtDistDepthPosWithLast(
     dag,
@@ -434,14 +453,14 @@ function combinedDagAppendSDist(
     id: recipient,
     weight: weight,
     posInOther: rLen,
-    dist: sdist
+    dist: sdist,
   });
   dag.dict[voter].totalWeight += weight;
   dag.dict[recipient].recDagVotes.push({
     id: voter,
     weight: weight,
     posInOther: sLen,
-    dist: rdist
+    dist: rdist,
   });
 }
 

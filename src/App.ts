@@ -1,48 +1,43 @@
-import express from "express";
-import assert from "assert";
-import { v4 as uuidv4 } from "uuid";
-
-// import Quote from 'inspirational-quotes';
-
+import { randomUUID } from "node:crypto";
+import { serve } from "@hono/node-server";
+import { createNodeWebSocket } from "@hono/node-ws";
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import type { WSContext } from "hono/ws";
+import type { Address, Log } from "viem";
 import {
-  GraphData,
-  address0,
-  NodeDataStore,
-  DagVote,
-  DagVoteString,
-  joinTree,
-  changeName,
+  anthillAbi,
+  makeAnthillContract,
+  makePublicClient,
+} from "./anthillContract";
+import {
   addDagVote,
-  removeDagVote,
-  leaveTree,
-  switchPositionWithParent,
-  moveTreeVote,
+  address0,
+  changeName,
+  type DagVote,
+  type DagVoteString,
   dagVoteString,
+  type GraphData,
+  joinTree,
+  leaveTree,
+  moveTreeVote,
+  type NodeDataStore,
+  removeDagVote,
+  switchPositionWithParent,
 } from "./dagBase";
+import { loadAnthillGraph } from "./dagLoading";
 import {
   calculateDepthAndRelRoot,
   calculateReputation,
   findRandomLeaf,
 } from "./dagProcessing";
-import { loadAnthillGraph } from "./dagLoading";
-import { Anthill__factory } from "./typechain";
-import { ethers, JsonRpcApiProviderOptions } from "ethers";
-
-// import WebSocket, { WebSocketServer as WSWebSocketServer } from 'ws';
-
-const http = require("http");
-const { Server } = require("ws");
 
 /////////////////////////////////////////
 
-// Spinning the http exress server and the WebSocket server on the same port.
-const app = express();
+// Spinning the Hono http server and the WebSocket server on the same port.
+const app = new Hono();
 
-const server = http.createServer(app, { trustProxy: true });
-// const WebSocketServer = WebSocket.Server || WSWebSocketServer;
-// const wsServer = new WebSocketServer({ server: server, clientTracking: true });
-
-const wsServer = new Server({ server });
+const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
 
 let port = process.env.PORT;
 
@@ -50,129 +45,117 @@ if (port == null || port == "") {
   port = "5001";
 }
 
-server.listen(port, () => {
-  console.log(`WebSocket and http server is running on port ${port}`);
-  crawlEthereum(testing);
-});
-
 // I'm maintaining all active connections in this object
-var clients: { [id: string]: string } = {};
-
-// A new client connection request received
-wsServer.on("connection", function connection(ws: any, req: any) {
-  // Generate a unique code for every user
-  const userId = uuidv4();
-  console.log(`Recieved a new connection.`);
-
-  // Store the new connection and handle messages
-  clients[userId] = ws;
-  ws.uid = userId;
-
-  console.log(`${userId} connected.`);
-
-  ws.on("message", function incoming(message: any) {
-    console.log("received: %s", message);
-  });
-  ws.on("error", (err: any) => {
-    console.log(err.stack);
-  });
-
-  ws.send("Hello from the server");
-});
+const clients: { [id: string]: WSContext } = {};
 
 //////////////////////////////
 ////// serve
 
-app.use(function (req, res, next) {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept",
-  );
-  next();
-});
+// permissive CORS (Access-Control-Allow-Origin: *)
+app.use(
+  "*",
+  cors({
+    origin: "*",
+    allowHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept"],
+  }),
+);
 
-app.use((err: any, req: any, res: any, next: any) => {
-  res.locals.error = err.response.data;
-  const status = err.status || 500;
-  res.status(status);
-  res.render("error");
-});
+// WebSocket endpoint. Accepts connections and (via replaceServe) broadcasts
+// the string "update" to all clients on graph changes.
+app.get(
+  "/",
+  upgradeWebSocket(() => {
+    const userId = randomUUID();
+    return {
+      onOpen(_event, ws) {
+        console.log(`Recieved a new connection.`);
+        clients[userId] = ws;
+        console.log(`${userId} connected.`);
+        ws.send("Hello from the server");
+      },
+      onMessage(event) {
+        console.log("received: %s", event.data);
+      },
+      onError(err) {
+        console.log(err);
+      },
+      onClose() {
+        delete clients[userId];
+      },
+    };
+  }),
+);
 
-app.get("/maxRelRootDepth", function (req, res) {
+app.get("/maxRelRootDepth", (c) => {
   console.log("getting max rel root");
-  res.send({ maxRelRootDepth: maxRelRootDepth });
+  return c.json({ maxRelRootDepth: maxRelRootDepth });
 });
 
-app.get("/rootId", function (req, res) {
+app.get("/rootId", (c) => {
   console.log("getting root");
-  res.send({ id: anthillRootIdServe });
+  return c.json({ id: anthillRootIdServe });
 });
 
-app.get("/isNodeInGraph/:id", function (req, res) {
-  console.log("isNodeInGraph", req.params.id);
-  if (anthillGraphServe.dict[req.params.id] === undefined) {
-    res.send({ isNodeInGraph: false });
+app.get("/isNodeInGraph/:id", (c) => {
+  const id = c.req.param("id");
+  console.log("isNodeInGraph", id);
+  if (anthillGraphServe.dict[id] === undefined) {
+    return c.json({ isNodeInGraph: false });
   } else {
-    res.send({ isNodeInGraph: true });
+    return c.json({ isNodeInGraph: true });
   }
 });
 
-// app.get("/anthillGraphNum", function(req, res) {
-//     // console.log("getting anthillGraphNum")
-//     res.send({"anthillGraphNum": anthillGraphNumServe});
-// });
-
-app.get("/id/:id", function (req, res) {
-  console.log("Getting id: ", req.params.id);
+app.get("/id/:id", (c) => {
+  const id = c.req.param("id");
+  console.log("Getting id: ", id);
   if (
-    req.params.id === "undefined" ||
-    req.params.id === undefined ||
-    anthillGraphServe.dict[req.params.id] === undefined
+    id === "undefined" ||
+    id === undefined ||
+    anthillGraphServe.dict[id] === undefined
   ) {
-    res.status(404).send({ message: "User not found" });
+    return c.json({ message: "User not found" }, 404);
   } else {
-    res.send({
-      nodeData: NodeDataStoreCollapse(anthillGraphServe.dict[req.params.id]),
+    return c.json({
+      nodeData: NodeDataStoreCollapse(anthillGraphServe.dict[id]),
     });
   }
 });
 
-app.get("/bareId/:id", function (req, res) {
-  console.log("Getting bare id: ", req.params.id);
-  // console.log("displaying: ", anthillGraphServe[req.params.id])
-  var nodeData = anthillGraphServe.dict[req.params.id];
+app.get("/bareId/:id", (c) => {
+  const id = c.req.param("id");
+  console.log("Getting bare id: ", id);
+  // console.log("displaying: ", anthillGraphServe[id])
+  const nodeData = anthillGraphServe.dict[id];
 
-  res.send({ nodeData: NodeDataBareCollapse(nodeData) });
+  return c.json({ nodeData: NodeDataBareCollapse(nodeData) });
 });
 
-app.get("/randomLeaf", function (req, res) {
+app.get("/randomLeaf", (c) => {
   console.log("getting random leaf");
 
-  res.send({ randomLeaf: randomLeafServe });
+  return c.json({ randomLeaf: randomLeafServe });
 });
 
-// let port = process.env.PORT;
-
-// if(port == null || port == "") {
-//     port = "5001";
-// }
-
-// // using the same port as ws, so redundunt
-// app.listen(port, function() {
-//     console.log("Server started successfully");
-//     // console.log("Crawling ethereum for data");
-//     // crawlEthereum();
-
-// });
+const server = serve(
+  {
+    fetch: app.fetch,
+    port: Number(port),
+  },
+  () => {
+    console.log(`WebSocket and http server is running on port ${port}`);
+    crawlEthereum(testing);
+  },
+);
+injectWebSocket(server);
 
 /////////////////////////////////////////
 
-var anthillGraphServe = {} as GraphData;
-var anthillGraphNumServe = 0;
+let anthillGraphServe = {} as GraphData;
+let anthillGraphNumServe = 0;
 
-var anthillRootIdServe = address0;
-var randomLeafServe = address0;
+let anthillRootIdServe = address0;
+let randomLeafServe = address0;
 
 function replaceServe() {
   anthillGraphServe = anthillGraph;
@@ -180,13 +163,13 @@ function replaceServe() {
   anthillRootIdServe = anthillRootId;
   randomLeafServe = randomLeaf;
 
-  wsServer.clients.forEach((client: any) => {
+  Object.values(clients).forEach((client) => {
     client.send("update");
   });
 }
 
 function NodeDataStoreCollapse(node: NodeDataStore): NodeDataString {
-  var nodec = {} as NodeDataString;
+  const nodec = {} as NodeDataString;
   nodec.id = node.id;
   nodec.name = node.name;
 
@@ -216,41 +199,29 @@ function NodeDataStoreCollapse(node: NodeDataStore): NodeDataString {
 ///// Load
 
 // web3
-var providerURL: string;
-var anthillContractAddress: string;
+let providerURL: string;
+let anthillContractAddress: Address;
 
 const testing = true;
 
 if (testing) {
-   providerURL = "ws://localhost:8545";
-  // providerURL = "ws://127.0.0.1:3051"; // zksync test node
+  providerURL = "ws://localhost:8545";
 
-  // anthillContractAddress = "0x111C3E89Ce80e62EE88318C2804920D4c96f92bb"; // zk forge with lib
-  //  anthillContractAddress = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512" // forge with lib
-  anthillContractAddress ="0x5fbdb2315678afecb367f032d93f642f64180aa3" // forge without lib
+  anthillContractAddress = "0x5fbdb2315678afecb367f032d93f642f64180aa3"; // forge without lib
 } else {
-  providerURL = "wss://sepolia.era.zksync.dev/ws";
+  providerURL =
+    process.env.RPC_URL || "wss://ethereum-sepolia-rpc.publicnode.com";
 
-  anthillContractAddress = "0xe42923350EF3a534f84bb101453D9B442d42Bf0c"; // zksync sepolia
+  anthillContractAddress = (process.env.CONTRACT_ADDRESS ||
+    "0x0000000000000000000000000000000000000000") as Address;
 }
 
-const options: JsonRpcApiProviderOptions = {
-  polling: true,
-  staticNetwork: null,
-  batchStallTime: 60000, // ms
-  batchMaxSize: 5,
-  cacheTimeout: 60000,
-  pollingInterval: 60000
-};
-
-// var web3 = new Web3(new Web3.providers.WebsocketProvider(providerURL, options));
-const webSocketProvider = new ethers.WebSocketProvider(providerURL,undefined, options);
+const publicClient = makePublicClient(providerURL);
 
 // contract
-
-let AnthillContract = Anthill__factory.connect(
+const AnthillContract = makeAnthillContract(
   anthillContractAddress,
-  webSocketProvider
+  publicClient,
 );
 
 // types
@@ -303,7 +274,7 @@ export type NodeDataBareString = {
 };
 
 function NodeDataBareCollapse(node: NodeDataBare): NodeDataBareString {
-  var nodec = {} as NodeDataBareString;
+  const nodec = {} as NodeDataBareString;
   nodec.id = node.id;
   nodec.name = node.name;
   nodec.totalWeight = node.totalWeight.toString();
@@ -315,12 +286,12 @@ function NodeDataBareCollapse(node: NodeDataBare): NodeDataBareString {
   return nodec;
 }
 
-var anthillGraph = {} as GraphData;
-var anthillGraphByDepth = [[]] as string[][];
-var anthillGraphNum = 0;
-var maxRelRootDepth = 6;
-var anthillRootId = address0;
-var randomLeaf = address0;
+const anthillGraph = {} as GraphData;
+let anthillGraphByDepth = [[]] as string[][];
+let anthillGraphNum = 0;
+let maxRelRootDepth = 6;
+let anthillRootId = address0;
+let randomLeaf = address0;
 
 async function crawlEthereum(testing: boolean) {
   console.log("Loading graph (slowest part)");
@@ -338,153 +309,68 @@ async function crawlEthereum(testing: boolean) {
   console.log("Finding random leaf");
   randomLeaf = findRandomLeaf(anthillGraph);
   console.log("The found random leaf is: ", randomLeaf);
+  anthillRootId = anthillGraph.rootId;
+  maxRelRootDepth = anthillGraph.maxRelRootDepth;
   replaceServe();
 
-  // start subscription
-  webSocketProvider.on(
-    {
-      address: anthillContractAddress,
-      topics: []
-    },
-    async (log) => {
-      console.log("received something");
-
-      if (log) {
-        console.log("received a non error");
-
-        // for testing we copy
-        // var anthillGraphCopy = (JSON.parse(JSON.stringify(anthillGraph))) as GraphData;
-        // var anthillGraphByDepthCopy = [[]] as string[][];
-
-        // assert (deepEqual(anthillGraph, anthillGraphCopy))
-        // console.log("copy sanity check passed")
-
-        // anthillGraphCopy.dict["0x0000000000000000000000000000000000000004"].recDagVotes[0][1][0].posInOther= 7;
-        // assert (deepEqual(anthillGraph, anthillGraphCopy)==false)
-        // console.log("copy sanity check 2 passed")
-
-        if (
-          log.topics[0] ==
-          ethers.id(
-            "JoinTreeEvent(address,string,address)"
-          )
-        ) {
-          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
-            ["address", "string", "address"],
-            log.data
-          );
-          const [voter, name, recipient] = decodedData;
-          console.log("joinTreeEvent", voter, name, recipient);
-          joinTree(anthillGraph, voter, name, recipient);
-        } else if (
-          log.topics[0] ==
-          ethers.id("ChangeNameEvent(address,string)")
-        ) {
-          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
-            ["address", "string"],
-            log.data
-          );
-          const [voter, newName] = decodedData;
-          console.log("changeNameEvent", voter, newName);
-          changeName(anthillGraph, voter, newName);
-        } else if (
-          log.topics[0] ==
-          ethers.id(
-            "AddDagVoteEvent(address,address,uint256)"
-          )
-        ) {
-          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
-            ["address", "address", "uint256"],
-            log.data
-          );
-          const [voter, recipient, weight] = decodedData;
-          console.log("addDagVoteEvent", voter, recipient, weight);
-          addDagVote(anthillGraph, voter, recipient, weight);
-        } else if (
-          log.topics[0] ==
-          ethers.id(
-            "RemoveDagVoteEvent(address,address)"
-          )
-        ) {
-          const [voter, recipient]= ethers.AbiCoder.defaultAbiCoder().decode(
-            ["address", "address"],
-            log.data
-          );
-          console.log("removeDagVote", voter, recipient);
-          removeDagVote(anthillGraph, voter, recipient);
-        } else if (
-          log.topics[0] ==
-          ethers.id("LeaveTreeEvent(address)")
-        ) {
-          const [voter] = ethers.AbiCoder.defaultAbiCoder().decode(
-            ["address"],
-            log.data
-          );
-          console.log("leaveTreeEvent", voter);
-          leaveTree(anthillGraph, voter);
-        } else if (
-          log.topics[0] ==
-          ethers.id(
-            "SwitchPositionWithParentEvent(address)"
-          )
-        ) {
-          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
-            ["address"],
-            log.data
-          );
-          const [voter] = decodedData;
-          console.log("switchPositionWithParentEvent", voter);
-          switchPositionWithParent(anthillGraph, voter);
-        } else if (
-          log.topics[0] ==
-          ethers.id(
-            "MoveTreeVoteEvent(address,address)"
-          )
-        ) {
-          const decodedData = ethers.AbiCoder.defaultAbiCoder().decode(
-            ["address", "address"],
-            log.data
-          );
-          const [voter, recipient] = decodedData;
-          console.log("moveTreeVoteEvent", voter, recipient);
-          moveTreeVote(anthillGraph, voter, recipient);
-        }
-
-        anthillGraphByDepth = [[]] as string[][];
-
-        calculateDepthAndRelRoot(anthillGraph, anthillGraphByDepth);
-        calculateReputation(anthillGraph, anthillGraphByDepth);
-
-        // for testing
-        // await loadAnthillGraph(anthillGraphCopy, anthillGraphByDepthCopy, anthillGraphNum, AnthillContract);
-
-        // calculateDepthAndRelRoot(anthillGraphCopy, anthillGraphByDepthCopy);
-        // calculateReputation(anthillGraphCopy, anthillGraphByDepthCopy);
-
-        // console.log("asserting")
-
-        // console.log( JSON.stringify(anthillGraph))
-        // console.log( JSON.stringify(anthillGraphCopy))
-
-        // assert (deepEqual(anthillGraph, anthillGraphCopy));
-        // console.log("testing assert success")
-
-        findRandomLeaf(anthillGraph);
-        anthillGraphNum += 1;
-
-        replaceServe();
-      } else {
-        console.log("we had some error in the eth subscription!", log.error);
+  // start subscription: watch all Anthill contract events and update the graph.
+  publicClient.watchContractEvent({
+    address: anthillContractAddress,
+    abi: anthillAbi,
+    onLogs: (logs) => {
+      for (const log of logs) {
+        handleLog(log as Log & { eventName?: string; args?: any });
       }
+
+      anthillGraphByDepth = [[]] as string[][];
+
+      calculateDepthAndRelRoot(anthillGraph, anthillGraphByDepth);
+      calculateReputation(anthillGraph, anthillGraphByDepth);
+
+      findRandomLeaf(anthillGraph);
+      anthillGraphNum += 1;
+
+      replaceServe();
     },
-  );
+    onError: (error) => {
+      console.log("we had some error in the eth subscription!", error);
+    },
+  });
 }
 
-// used for testing
-// function deepEqual(x:any, y:any):boolean {
-//     const ok = Object.keys, tx = typeof x, ty = typeof y;
-//     return x && y && tx === 'object' && tx === ty ? (
-//       ok(x).length === ok(y).length &&
-//         ok(x).every(key => deepEqual(x[key], y[key]))
-//     ) : (x === y);
-//   }
+function handleLog(log: Log & { eventName?: string; args?: any }) {
+  console.log("received something");
+
+  const eventName = log.eventName;
+  const args = log.args ?? {};
+
+  if (eventName === "JoinTreeEvent") {
+    const { voter, name, recipient } = args;
+    console.log("joinTreeEvent", voter, name, recipient);
+    joinTree(anthillGraph, voter, name, recipient);
+  } else if (eventName === "ChangeNameEvent") {
+    const { voter, newName } = args;
+    console.log("changeNameEvent", voter, newName);
+    changeName(anthillGraph, voter, newName);
+  } else if (eventName === "AddDagVoteEvent") {
+    const { voter, recipient, weight } = args;
+    console.log("addDagVoteEvent", voter, recipient, weight);
+    addDagVote(anthillGraph, voter, recipient, weight);
+  } else if (eventName === "RemoveDagVoteEvent") {
+    const { voter, recipient } = args;
+    console.log("removeDagVote", voter, recipient);
+    removeDagVote(anthillGraph, voter, recipient);
+  } else if (eventName === "LeaveTreeEvent") {
+    const { voter } = args;
+    console.log("leaveTreeEvent", voter);
+    leaveTree(anthillGraph, voter);
+  } else if (eventName === "SwitchPositionWithParentEvent") {
+    const { voter } = args;
+    console.log("switchPositionWithParentEvent", voter);
+    switchPositionWithParent(anthillGraph, voter);
+  } else if (eventName === "MoveTreeVoteEvent") {
+    const { voter, recipient } = args;
+    console.log("moveTreeVoteEvent", voter, recipient);
+    moveTreeVote(anthillGraph, voter, recipient);
+  }
+}
