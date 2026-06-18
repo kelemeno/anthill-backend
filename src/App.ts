@@ -31,6 +31,7 @@ import {
   calculateReputation,
   findRandomLeaf,
 } from "./dagProcessing";
+import { buildHistory, type History } from "./dagHistory";
 
 /////////////////////////////////////////
 
@@ -135,6 +136,26 @@ app.get("/randomLeaf", (c) => {
   console.log("getting random leaf");
 
   return c.json({ randomLeaf: randomLeafServe });
+});
+
+// Full evolution of the graph as per-event snapshots, built by replaying all
+// past on-chain events. Built once lazily and cached in memory.
+let historyCache: History | null = null;
+let historyPromise: Promise<History> | null = null;
+
+app.get("/history", async (c) => {
+  console.log("getting history");
+  if (historyCache === null) {
+    if (historyPromise === null) {
+      historyPromise = buildHistory(
+        publicClient,
+        anthillContractAddress,
+        AnthillContract,
+      );
+    }
+    historyCache = await historyPromise;
+  }
+  return c.json(historyCache);
 });
 
 const server = serve(
