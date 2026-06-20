@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { serve } from "@hono/node-server";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { Hono } from "hono";
@@ -165,7 +167,11 @@ const server = serve(
   },
   () => {
     console.log(`WebSocket and http server is running on port ${port}`);
-    crawlEthereum(testing);
+    if (snapshotMode) {
+      loadSnapshot();
+    } else {
+      crawlEthereum(testing);
+    }
   },
 );
 injectWebSocket(server);
@@ -223,9 +229,22 @@ function NodeDataStoreCollapse(node: NodeDataStore): NodeDataString {
 let providerURL: string;
 let anthillContractAddress: Address;
 
+// Read-only demo: with SNAPSHOT_MODE=true the server reads NO chain — it loads a
+// frozen graph from anthillSnapshot.json and serves it through the same
+// endpoints. CAPTURE_SNAPSHOT=true does a one-off live load (against the testing
+// anvil) and writes that file.
+const snapshotMode = process.env.SNAPSHOT_MODE === "true";
+const captureSnapshot = process.env.CAPTURE_SNAPSHOT === "true";
+const snapshotPath = join(process.cwd(), "anthillSnapshot.json");
+
 const testing = true;
 
-if (testing) {
+if (snapshotMode) {
+  // Chain config is unused in snapshot mode; harmless placeholder so no socket
+  // is ever opened.
+  providerURL = "http://localhost:1";
+  anthillContractAddress = address0 as Address;
+} else if (testing) {
   providerURL = "ws://localhost:8545";
 
   anthillContractAddress = "0x5fbdb2315678afecb367f032d93f642f64180aa3"; // forge without lib
@@ -314,6 +333,44 @@ let maxRelRootDepth = 6;
 let anthillRootId = address0;
 let randomLeaf = address0;
 
+// JSON (de)serialisation that survives bigints (totalWeight / currentRep / dag
+// vote weights), used by the snapshot read/write.
+type Snapshot = { graph: GraphData; history: History; randomLeaf: string };
+
+function bigintReplacer(_key: string, value: unknown) {
+  return typeof value === "bigint" ? { __bigint__: value.toString() } : value;
+}
+function bigintReviver(_key: string, value: unknown) {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    "__bigint__" in value &&
+    typeof (value as { __bigint__: unknown }).__bigint__ === "string"
+  ) {
+    return BigInt((value as { __bigint__: string }).__bigint__);
+  }
+  return value;
+}
+
+// Read-only path: load the frozen graph + history straight into the served
+// state. No chain client, no event subscription.
+function loadSnapshot() {
+  console.log("Loading frozen snapshot from", snapshotPath);
+  const parsed = JSON.parse(
+    readFileSync(snapshotPath, "utf8"),
+    bigintReviver,
+  ) as Snapshot;
+  anthillGraph.dict = parsed.graph.dict;
+  anthillGraph.rootId = parsed.graph.rootId;
+  anthillGraph.maxRelRootDepth = parsed.graph.maxRelRootDepth;
+  anthillRootId = parsed.graph.rootId;
+  maxRelRootDepth = parsed.graph.maxRelRootDepth;
+  randomLeaf = parsed.randomLeaf;
+  historyCache = parsed.history;
+  replaceServe();
+  console.log("Snapshot loaded: nodes =", Object.keys(anthillGraph.dict).length);
+}
+
 async function crawlEthereum(testing: boolean) {
   console.log("Loading graph (slowest part)");
   await loadAnthillGraph(
@@ -333,6 +390,21 @@ async function crawlEthereum(testing: boolean) {
   anthillRootId = anthillGraph.rootId;
   maxRelRootDepth = anthillGraph.maxRelRootDepth;
   replaceServe();
+
+  // One-off capture: build the history, write the frozen snapshot, and exit
+  // (no event subscription needed). Run locally against the seeded anvil.
+  if (captureSnapshot) {
+    console.log("Capturing snapshot (building history)...");
+    const history = await buildHistory(
+      publicClient,
+      anthillContractAddress,
+      AnthillContract,
+    );
+    const snap: Snapshot = { graph: anthillGraph, history, randomLeaf };
+    writeFileSync(snapshotPath, JSON.stringify(snap, bigintReplacer));
+    console.log("Snapshot written to", snapshotPath, "— exiting.");
+    process.exit(0);
+  }
 
   // start subscription: watch all Anthill contract events and update the graph.
   publicClient.watchContractEvent({
