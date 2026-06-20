@@ -1,1 +1,1 @@
-web: node build/App.js
+web: SNAPSHOT_MODE=true node build/App.js
