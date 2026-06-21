@@ -1,0 +1,13 @@
+# Render Blueprint — read-only demo backend (snapshot mode, no chain).
+# Render injects $PORT automatically (App.ts reads process.env.PORT) and
+# auto-deploys on every push to the connected branch's main.
+services:
+  - type: web
+    name: anthill-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node build/App.js
+    envVars:
+      - key: SNAPSHOT_MODE
+        value: "true"
