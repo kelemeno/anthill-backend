@@ -183,6 +183,11 @@ async function main() {
 
   node = (await call(`id/${session.user.id}`)).data.nodeData;
   assert.equal(node.name, "Smoke 2");
+
+  // The whole-graph endpoint serves the same nodes as /id.
+  const graph = (await call("graph")).data;
+  assert.deepEqual(graph.nodes[session.user.id], node);
+  assert.equal(graph.rootId, (await call("rootId")).data.id);
   assert.deepEqual(node.sentDagVotes.map((v: any) => v.id).sort(), [leaf, grandparent].sort());
 
   // Moving under yourself is refused (it used to detach the voter into a loop).

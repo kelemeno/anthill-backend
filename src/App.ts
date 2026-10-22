@@ -150,6 +150,22 @@ app.get("/bareId/:id", (c) => {
   return c.json({ nodeData: NodeDataBareCollapse(nodeData) });
 });
 
+// The whole served graph in one response, so the frontend can load it with a
+// single request instead of one per node. `version` changes on every update.
+app.get("/graph", (c) => {
+  const nodes: { [id: string]: NodeDataString } = {};
+  for (const [id, node] of Object.entries(anthillGraphServe.dict)) {
+    nodes[id] = NodeDataStoreCollapse(node);
+  }
+  return c.json({
+    version: anthillGraphNumServe,
+    rootId: anthillRootIdServe,
+    maxRelRootDepth: maxRelRootDepth,
+    randomLeaf: randomLeafServe,
+    nodes,
+  });
+});
+
 app.get("/randomLeaf", (c) => {
   console.log("getting random leaf");
 
