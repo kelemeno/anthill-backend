@@ -129,7 +129,7 @@ function applyEvent(dag: GraphData, eventName: string, args: any) {
   }
 }
 
-function snapshotNodes(dag: GraphData): HistoryNode[] {
+export function snapshotNodes(dag: GraphData): HistoryNode[] {
   const nodes: HistoryNode[] = [];
   for (const id of Object.keys(dag.dict)) {
     // exclude the sentinels.

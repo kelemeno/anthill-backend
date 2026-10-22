@@ -1,13 +1,25 @@
-# Render Blueprint — read-only demo backend (snapshot mode, no chain).
-# Render injects $PORT automatically (App.ts reads process.env.PORT) and
-# auto-deploys on every push to the connected branch's main.
+# Render Blueprint — the off-chain backend: the tree lives in an append-only log
+# on a persistent disk and people sign in with passkeys (see src/offchain.ts).
+# Disks need a paid instance, hence the starter plan; with a disk Render stops
+# the old instance before starting the new one, so a deploy has a few seconds
+# of downtime. Render injects $PORT (App.ts reads process.env.PORT) and
+# auto-deploys on every push to main.
 services:
   - type: web
     name: anthill-backend
     runtime: node
-    plan: free
+    plan: starter
     buildCommand: npm install && npm run build
     startCommand: node build/App.js
+    disk:
+      name: anthill-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
-      - key: SNAPSHOT_MODE
-        value: "true"
+      - key: DATA_DIR
+        value: /var/data
+      # passkeys are bound to the frontend's domain
+      - key: RP_ID
+        value: anthilldao.dev
+      - key: ORIGINS
+        value: https://anthilldao.dev

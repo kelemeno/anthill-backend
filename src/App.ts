@@ -8,10 +8,12 @@ import { cors } from "hono/cors";
 import type { WSContext } from "hono/ws";
 import type { Address, Log } from "viem";
 import {
+  type AnthillContractType,
   anthillAbi,
   makeAnthillContract,
   makePublicClient,
 } from "./anthillContract";
+import { AuthError, PasskeyAuth } from "./auth";
 import {
   addDagVote,
   address0,
@@ -33,7 +35,15 @@ import {
   calculateReputation,
   findRandomLeaf,
 } from "./dagProcessing";
-import { buildHistory, type History } from "./dagHistory";
+import {
+  buildHistory,
+  type History,
+  type HistoryStep,
+  snapshotNodes,
+} from "./dagHistory";
+import type { AnthillEngine, EngineEvent } from "./engine";
+import { ActionError, OffchainTree } from "./offchain";
+import { type ActionEntry, Store } from "./store";
 
 /////////////////////////////////////////
 
@@ -59,7 +69,13 @@ app.use(
   "*",
   cors({
     origin: "*",
-    allowHeaders: ["Origin", "X-Requested-With", "Content-Type", "Accept"],
+    allowHeaders: [
+      "Origin",
+      "X-Requested-With",
+      "Content-Type",
+      "Accept",
+      "Authorization",
+    ],
   }),
 );
 
@@ -160,6 +176,86 @@ app.get("/history", async (c) => {
   return c.json(historyCache);
 });
 
+//////////////////////////////
+////// passkey sign-in and actions (off-chain mode only)
+
+app.onError((err, c) => {
+  if (err instanceof AuthError) {
+    return c.json({ error: err.message }, 401);
+  }
+  if (err instanceof ActionError) {
+    return c.json({ error: err.message }, 400);
+  }
+  console.error(err);
+  return c.json({ error: "internal error" }, 500);
+});
+
+function requireOffchain() {
+  if (offchain === undefined || auth === undefined) {
+    throw new ActionError("this server is read-only");
+  }
+  return { offchain, auth };
+}
+
+async function jsonBody(c: { req: { json: () => Promise<any> } }) {
+  return c.req.json().catch(() => {
+    throw new ActionError("expected a JSON body");
+  });
+}
+
+app.post("/auth/register/options", async (c) => {
+  const { auth } = requireOffchain();
+  const { name } = await jsonBody(c);
+  if (typeof name !== "string" || name.trim() === "" || name.trim().length > 40) {
+    throw new ActionError("name must be 1-40 characters");
+  }
+  return c.json(await auth.registrationOptions(name.trim()));
+});
+
+app.post("/auth/register/verify", async (c) => {
+  const { auth } = requireOffchain();
+  const { flowId, response } = await jsonBody(c);
+  return c.json(await auth.verifyRegistration(flowId, response));
+});
+
+app.post("/auth/login/options", async (c) => {
+  const { auth } = requireOffchain();
+  return c.json(await auth.authenticationOptions());
+});
+
+app.post("/auth/login/verify", async (c) => {
+  const { auth } = requireOffchain();
+  const { flowId, response } = await jsonBody(c);
+  return c.json(await auth.verifyAuthentication(flowId, response));
+});
+
+app.get("/auth/me", (c) => {
+  const { auth } = requireOffchain();
+  return c.json({ user: auth.userFromHeader(c.req.header("Authorization")) });
+});
+
+// Run one tree action as the signed-in user. Actions are handled one at a time
+// so each history step shows the graph right after its own action.
+app.post("/action", async (c) => {
+  const { offchain, auth } = requireOffchain();
+  const user = auth.userFromHeader(c.req.header("Authorization"));
+  const body = await jsonBody(c);
+  await serially(async () => {
+    const { entry, events } = offchain.execute(user.id, body);
+    await rebuildFromEngine(offchain.engine);
+    historyCache?.steps.push(historyStep(entry, events));
+    replaceServe();
+  });
+  return c.json({ ok: true });
+});
+
+let actionQueue: Promise<void> = Promise.resolve();
+function serially(fn: () => Promise<void>): Promise<void> {
+  const result = actionQueue.then(fn);
+  actionQueue = result.catch(() => undefined);
+  return result;
+}
+
 const server = serve(
   {
     fetch: app.fetch,
@@ -169,6 +265,8 @@ const server = serve(
     console.log(`WebSocket and http server is running on port ${port}`);
     if (snapshotMode) {
       loadSnapshot();
+    } else if (offchainMode) {
+      startOffchain();
     } else {
       crawlEthereum(testing);
     }
@@ -229,18 +327,26 @@ function NodeDataStoreCollapse(node: NodeDataStore): NodeDataString {
 let providerURL: string;
 let anthillContractAddress: Address;
 
-// Read-only demo: with SNAPSHOT_MODE=true the server reads NO chain — it loads a
-// frozen graph from anthillSnapshot.json and serves it through the same
-// endpoints. CAPTURE_SNAPSHOT=true does a one-off live load (against the testing
-// anvil) and writes that file.
+// Three modes:
+// - off-chain (default): the tree lives on this server (see offchain.ts),
+//   people sign in with passkeys, state is kept in DATA_DIR (default ./data).
+//   A fresh data dir is seeded from anthillSnapshot.json, or starts empty with
+//   SEED=empty.
+// - SNAPSHOT_MODE=true: read-only demo, serves the frozen graph from
+//   anthillSnapshot.json.
+// - CHAIN_MODE=true: the original setup, reads the Anthill contract and follows
+//   its events. CAPTURE_SNAPSHOT=true does a one-off live load (against the
+//   testing anvil) and writes the snapshot file.
 const snapshotMode = process.env.SNAPSHOT_MODE === "true";
 const captureSnapshot = process.env.CAPTURE_SNAPSHOT === "true";
+const chainMode = process.env.CHAIN_MODE === "true" || captureSnapshot;
+const offchainMode = !snapshotMode && !chainMode;
 const snapshotPath = join(process.cwd(), "anthillSnapshot.json");
 
 const testing = true;
 
-if (snapshotMode) {
-  // Chain config is unused in snapshot mode; harmless placeholder so no socket
+if (snapshotMode || offchainMode) {
+  // Chain config is unused without a chain; harmless placeholder so no socket
   // is ever opened.
   providerURL = "http://localhost:1";
   anthillContractAddress = address0 as Address;
@@ -356,10 +462,7 @@ function bigintReviver(_key: string, value: unknown) {
 // state. No chain client, no event subscription.
 function loadSnapshot() {
   console.log("Loading frozen snapshot from", snapshotPath);
-  const parsed = JSON.parse(
-    readFileSync(snapshotPath, "utf8"),
-    bigintReviver,
-  ) as Snapshot;
+  const parsed = readSnapshot();
   anthillGraph.dict = parsed.graph.dict;
   anthillGraph.rootId = parsed.graph.rootId;
   anthillGraph.maxRelRootDepth = parsed.graph.maxRelRootDepth;
@@ -369,6 +472,87 @@ function loadSnapshot() {
   historyCache = parsed.history;
   replaceServe();
   console.log("Snapshot loaded: nodes =", Object.keys(anthillGraph.dict).length);
+}
+
+function readSnapshot(): Snapshot {
+  return JSON.parse(readFileSync(snapshotPath, "utf8"), bigintReviver) as Snapshot;
+}
+
+let offchain: OffchainTree | undefined;
+let auth: PasskeyAuth | undefined;
+
+async function startOffchain() {
+  const dataDir = process.env.DATA_DIR || join(process.cwd(), "data");
+  const store = new Store(dataDir);
+  console.log("Off-chain mode, data in", dataDir);
+
+  // The snapshot's history leads up to the seeded state, so new steps continue
+  // it.
+  historyCache = { steps: [] };
+  if (store.seed === undefined && store.actions.length === 0) {
+    if (process.env.SEED !== "empty") {
+      console.log("Seeding a new tree from", snapshotPath);
+      store.setSeed(readSnapshot().graph);
+    }
+  }
+  if (store.seed !== undefined) {
+    historyCache = readSnapshot().history;
+  }
+
+  offchain = new OffchainTree(store);
+  auth = new PasskeyAuth(store);
+
+  await offchain.load(async (entry, events) => {
+    await rebuildFromEngine(offchain!.engine);
+    historyCache!.steps.push(historyStep(entry, events));
+  });
+  await rebuildFromEngine(offchain.engine);
+  replaceServe();
+  console.log(
+    "Tree loaded: nodes =",
+    Object.keys(anthillGraph.dict).length,
+    "actions =",
+    store.actions.length,
+  );
+}
+
+// Recompute the served graph from the engine. The engine answers the same reads
+// as the contract, so this reuses the chain loader.
+async function rebuildFromEngine(engine: AnthillEngine) {
+  const graph = {} as GraphData;
+  await loadAnthillGraph(
+    graph,
+    [[]],
+    0,
+    engine as unknown as AnthillContractType,
+    true,
+  );
+  const byDepth = [[]] as string[][];
+  calculateDepthAndRelRoot(graph, byDepth);
+  calculateReputation(graph, byDepth);
+
+  anthillGraph.dict = graph.dict;
+  anthillGraph.rootId = graph.rootId;
+  anthillGraph.maxRelRootDepth = graph.maxRelRootDepth;
+  anthillRootId = graph.rootId;
+  maxRelRootDepth = graph.maxRelRootDepth;
+  randomLeaf = findRandomLeaf(anthillGraph);
+  anthillGraphNum += 1;
+}
+
+function historyStep(entry: ActionEntry, events: EngineEvent[]): HistoryStep {
+  const args = entry.action.args as Record<string, string | undefined>;
+  const index = historyCache?.steps.length ?? 0;
+  return {
+    index,
+    eventName: events[events.length - 1]?.eventName ?? entry.action.fn,
+    voter: entry.by,
+    recipient: args.recipient ?? "",
+    name: args.name ?? "",
+    weight: args.weight ?? "0",
+    blockNumber: index,
+    nodes: snapshotNodes(anthillGraph),
+  };
 }
 
 async function crawlEthereum(testing: boolean) {
