@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { serve } from "@hono/node-server";
@@ -42,7 +42,8 @@ import {
   snapshotNodes,
 } from "./dagHistory";
 import type { AnthillEngine, EngineEvent } from "./engine";
-import { ActionError, OffchainTree } from "./offchain";
+import { Community } from "./community";
+import { ActionError, inviteOnly, OffchainTree } from "./offchain";
 import { type ActionEntry, Store } from "./store";
 
 /////////////////////////////////////////
@@ -162,6 +163,7 @@ app.get("/graph", (c) => {
     rootId: anthillRootIdServe,
     maxRelRootDepth: maxRelRootDepth,
     randomLeaf: randomLeafServe,
+    config: { inviteOnly: offchainMode && inviteOnly },
     nodes,
   });
 });
@@ -193,24 +195,67 @@ app.get("/history", async (c) => {
 });
 
 //////////////////////////////
-////// passkey sign-in and actions (off-chain mode only)
+////// passkey sign-in, actions, invites, polls, profiles (off-chain mode only)
+
+class RateLimitError extends Error {}
 
 app.onError((err, c) => {
   if (err instanceof AuthError) {
     return c.json({ error: err.message }, 401);
   }
   if (err instanceof ActionError) {
-    return c.json({ error: err.message }, 400);
+    return c.json({ error: err.message, code: err.code }, 400);
+  }
+  if (err instanceof RateLimitError) {
+    return c.json({ error: "Too many requests, try again in a minute." }, 429);
   }
   console.error(err);
   return c.json({ error: "internal error" }, 500);
 });
 
+// Fixed one-minute windows per client IP, to blunt scripted sign-ups and spam.
+const rateWindows = new Map<string, { count: number; reset: number }>();
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, w] of rateWindows) if (w.reset < now) rateWindows.delete(key);
+}, 60_000).unref();
+
+function rateLimit(key: string, perMinute: number) {
+  const now = Date.now();
+  const w = rateWindows.get(key);
+  if (w === undefined || w.reset < now) {
+    rateWindows.set(key, { count: 1, reset: now + 60_000 });
+  } else if (++w.count > perMinute) {
+    throw new RateLimitError();
+  }
+}
+
+function clientIp(c: { req: { header: (name: string) => string | undefined } }) {
+  return (
+    c.req.header("cf-connecting-ip") ??
+    c.req.header("x-forwarded-for")?.split(",")[0].trim() ??
+    "local"
+  );
+}
+
+app.use("/auth/*", async (c, next) => {
+  rateLimit(`auth:${clientIp(c)}`, 30);
+  await next();
+});
+app.use("*", async (c, next) => {
+  if (c.req.method === "POST") rateLimit(`post:${clientIp(c)}`, 240);
+  await next();
+});
+
 function requireOffchain() {
-  if (offchain === undefined || auth === undefined) {
+  if (offchain === undefined || auth === undefined || community === undefined) {
     throw new ActionError("this server is read-only");
   }
-  return { offchain, auth };
+  return { offchain, auth, community };
+}
+
+function signedIn(c: { req: { header: (name: string) => string | undefined } }) {
+  return requireOffchain().auth.userFromHeader(c.req.header("Authorization"));
 }
 
 async function jsonBody(c: { req: { json: () => Promise<any> } }) {
@@ -223,7 +268,7 @@ app.post("/auth/register/options", async (c) => {
   const { auth } = requireOffchain();
   const { name } = await jsonBody(c);
   if (typeof name !== "string" || name.trim() === "" || name.trim().length > 40) {
-    throw new ActionError("name must be 1-40 characters");
+    throw new ActionError("Names must be 1-40 characters.");
   }
   return c.json(await auth.registrationOptions(name.trim()));
 });
@@ -246,15 +291,47 @@ app.post("/auth/login/verify", async (c) => {
 });
 
 app.get("/auth/me", (c) => {
+  return c.json({ user: signedIn(c) });
+});
+
+// Another passkey (device) for the signed-in account.
+app.post("/auth/passkeys/options", async (c) => {
   const { auth } = requireOffchain();
-  return c.json({ user: auth.userFromHeader(c.req.header("Authorization")) });
+  return c.json(await auth.addPasskeyOptions(signedIn(c)));
+});
+
+app.post("/auth/passkeys/verify", async (c) => {
+  const { auth } = requireOffchain();
+  const user = signedIn(c);
+  const { flowId, response } = await jsonBody(c);
+  return c.json(await auth.verifyAddPasskey(user, flowId, response));
+});
+
+// Lost every passkey: register a new one with the recovery code.
+app.post("/auth/recover/options", async (c) => {
+  const { auth } = requireOffchain();
+  rateLimit(`recover:${clientIp(c)}`, 10);
+  const { code } = await jsonBody(c);
+  if (typeof code !== "string") throw new ActionError("Enter your recovery code.");
+  return c.json(await auth.recoveryOptions(code));
+});
+
+app.post("/auth/recover/verify", async (c) => {
+  const { auth } = requireOffchain();
+  const { flowId, response } = await jsonBody(c);
+  return c.json(await auth.verifyRecovery(flowId, response));
+});
+
+app.post("/auth/recovery-code", (c) => {
+  const { auth } = requireOffchain();
+  return c.json({ recoveryCode: auth.newRecoveryCode(signedIn(c)) });
 });
 
 // Run one tree action as the signed-in user. Actions are handled one at a time
 // so each history step shows the graph right after its own action.
 app.post("/action", async (c) => {
-  const { offchain, auth } = requireOffchain();
-  const user = auth.userFromHeader(c.req.header("Authorization"));
+  const { offchain } = requireOffchain();
+  const user = signedIn(c);
   const body = await jsonBody(c);
   await serially(async () => {
     const { entry, events } = offchain.execute(user.id, body);
@@ -265,12 +342,113 @@ app.post("/action", async (c) => {
   return c.json({ ok: true });
 });
 
+// Dry-run up to 20 actions: for each, whether it would work and if not why.
+app.post("/check", async (c) => {
+  const { offchain } = requireOffchain();
+  const user = signedIn(c);
+  const { actions } = await jsonBody(c);
+  if (!Array.isArray(actions) || actions.length > 20) {
+    throw new ActionError("expected up to 20 actions");
+  }
+  return c.json({ results: offchain.check(user.id, actions) });
+});
+
 let actionQueue: Promise<void> = Promise.resolve();
 function serially(fn: () => Promise<void>): Promise<void> {
   const result = actionQueue.then(fn);
   actionQueue = result.catch(() => undefined);
   return result;
 }
+
+//// invites
+
+app.post("/invites", (c) => {
+  const { offchain } = requireOffchain();
+  const invite = offchain.createInvite(signedIn(c).id);
+  return c.json({ code: invite.code, expires: invite.expires });
+});
+
+app.get("/invites/:code", (c) => {
+  const { offchain } = requireOffchain();
+  const invite = offchain.validInvite(c.req.param("code"));
+  const inviter = offchainStore?.user(invite.under);
+  return c.json({
+    inviter: {
+      id: invite.under,
+      name: inviter?.name ?? anthillGraphServe.dict[invite.under]?.name ?? "",
+    },
+    expires: invite.expires,
+  });
+});
+
+//// profiles
+
+app.post("/profile", async (c) => {
+  const { community } = requireOffchain();
+  const profile = community.setProfile(signedIn(c).id, await jsonBody(c));
+  replaceServe();
+  return c.json({ profile });
+});
+
+//// polls
+
+app.get("/polls", (c) => {
+  const { community, auth } = requireOffchain();
+  let viewer: string | undefined;
+  try {
+    viewer = auth.userFromHeader(c.req.header("Authorization")).id;
+  } catch {
+    viewer = undefined;
+  }
+  return c.json({ polls: community.listPolls(viewer) });
+});
+
+app.post("/polls", async (c) => {
+  const { community } = requireOffchain();
+  return c.json({ poll: community.createPoll(signedIn(c).id, await jsonBody(c)) });
+});
+
+app.post("/polls/:id/vote", async (c) => {
+  const { community } = requireOffchain();
+  const user = signedIn(c);
+  return c.json({ poll: community.votePoll(user.id, c.req.param("id"), await jsonBody(c)) });
+});
+
+app.post("/polls/:id/close", (c) => {
+  const { community } = requireOffchain();
+  return c.json({ poll: community.closePoll(signedIn(c).id, c.req.param("id")) });
+});
+
+//// admin (ADMIN_TOKEN): log download for backups, invites for bootstrapping
+
+function requireAdmin(c: { req: { header: (name: string) => string | undefined } }) {
+  const token = process.env.ADMIN_TOKEN;
+  const given = c.req.header("Authorization")?.match(/^Bearer (.+)$/)?.[1] ?? "";
+  if (
+    !token ||
+    given.length !== token.length ||
+    !timingSafeEqual(Buffer.from(given), Buffer.from(token))
+  ) {
+    throw new AuthError("admin only");
+  }
+}
+
+app.get("/admin/log", (c) => {
+  requireAdmin(c);
+  if (offchainStore === undefined) throw new ActionError("this server has no log");
+  c.header("Content-Type", "application/x-ndjson");
+  return c.body(readFileSync(offchainStore.logPath));
+});
+
+app.post("/admin/invites", async (c) => {
+  requireAdmin(c);
+  const { offchain } = requireOffchain();
+  const { under } = await jsonBody(c);
+  const invite = offchain.createAdminInvite(
+    typeof under === "string" ? under.toLowerCase() : anthillRootIdServe,
+  );
+  return c.json({ code: invite.code, expires: invite.expires });
+});
 
 const server = serve(
   {
@@ -321,6 +499,12 @@ function NodeDataStoreCollapse(node: NodeDataStore): NodeDataString {
   nodec.totalWeight = node.totalWeight.toString();
   nodec.sentTreeVote = node.sentTreeVote;
   nodec.recTreeVotes = node.recTreeVotes;
+
+  const profile = offchainStore?.profile(node.id);
+  if (profile !== undefined) {
+    nodec.bio = profile.bio;
+    nodec.link = profile.link;
+  }
 
   nodec.sentDagVotes = [] as DagVoteString[];
   nodec.recDagVotes = [] as DagVoteString[];
@@ -403,6 +587,8 @@ export type NodeData = {
 export type NodeDataString = {
   id: string;
   name: string;
+  bio?: string;
+  link?: string;
   totalWeight: string;
   currentRep: string;
   depth: number;
@@ -496,6 +682,8 @@ function readSnapshot(): Snapshot {
 
 let offchain: OffchainTree | undefined;
 let auth: PasskeyAuth | undefined;
+let community: Community | undefined;
+let offchainStore: Store | undefined;
 
 async function startOffchain() {
   const dataDir = process.env.DATA_DIR || join(process.cwd(), "data");
@@ -517,6 +705,13 @@ async function startOffchain() {
 
   offchain = new OffchainTree(store);
   auth = new PasskeyAuth(store);
+  offchainStore = store;
+  const tree = offchain;
+  community = new Community(
+    store,
+    (id) => tree.engine.isInTree(id),
+    (id) => anthillGraphServe.dict?.[id]?.currentRep ?? 0n,
+  );
 
   await offchain.load(async (entry, events) => {
     await rebuildFromEngine(offchain!.engine);

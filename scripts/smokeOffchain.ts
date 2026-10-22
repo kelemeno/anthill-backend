@@ -1,24 +1,19 @@
 // End-to-end smoke test of off-chain mode: drives a running backend with a
 // software passkey (P-256, "none" attestation) the way a browser would.
-// Registers, signs in, joins the tree, votes, renames, then checks that a
-// restarted backend replays the log to the same graph.
+// Registers, signs in, joins, votes, renames, checks why actions fail, invites
+// a second user, sets a profile, runs a poll, adds a second passkey, recovers
+// with the recovery code and downloads the log as admin.
 //
-//   PORT=5098 DATA_DIR=/tmp/anthill-smoke npx tsx src/App.ts   # fresh data dir
-//   BACKEND=http://localhost:5098/ npx tsx scripts/smokeOffchain.ts
+//   PORT=5098 DATA_DIR=/tmp/anthill-smoke ADMIN_TOKEN=smoke-admin npx tsx src/App.ts
+//   BACKEND=http://localhost:5098/ ADMIN_TOKEN=smoke-admin npx tsx scripts/smokeOffchain.ts
 //
 // The backend must accept ORIGIN (default http://localhost:5173, the backend's
 // default ORIGINS) and RP_ID localhost.
 
-import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto";
 import assert from "node:assert/strict";
-import { isoCBOR } from "@simplewebauthn/server/helpers";
+import { SoftPasskey } from "./softPasskey";
 
 const backend = process.env.BACKEND || "http://localhost:5098/";
-const origin = process.env.ORIGIN || "http://localhost:5173";
-const rpID = "localhost";
-
-const b64url = (b: Uint8Array) => Buffer.from(b).toString("base64url");
-const sha256 = (b: Uint8Array | string) => createHash("sha256").update(b).digest();
 
 async function call(path: string, body?: unknown, token?: string) {
   const res = await fetch(backend + path, {
@@ -33,81 +28,6 @@ async function call(path: string, body?: unknown, token?: string) {
   return { status: res.status, data };
 }
 
-// A minimal platform authenticator holding one passkey.
-class SoftPasskey {
-  private keys = generateKeyPairSync("ec", { namedCurve: "P-256" });
-  readonly credentialId = randomBytes(16);
-  private counter = 0;
-  userHandle = "";
-
-  private authData(flags: number, attested?: Buffer) {
-    const count = Buffer.alloc(4);
-    count.writeUInt32BE(this.counter++);
-    return Buffer.concat([sha256(rpID), Buffer.from([flags]), count, attested ?? Buffer.alloc(0)]);
-  }
-
-  private clientData(type: string, challenge: string) {
-    return Buffer.from(JSON.stringify({ type, challenge, origin, crossOrigin: false }));
-  }
-
-  create(options: any) {
-    this.userHandle = options.user.id;
-    const jwk = this.keys.publicKey.export({ format: "jwk" });
-    const coseKey = isoCBOR.encode(
-      new Map<number, number | Uint8Array>([
-        [1, 2],
-        [3, -7],
-        [-1, 1],
-        [-2, Buffer.from(jwk.x!, "base64url")],
-        [-3, Buffer.from(jwk.y!, "base64url")],
-      ]),
-    );
-    const idLength = Buffer.alloc(2);
-    idLength.writeUInt16BE(this.credentialId.length);
-    const attested = Buffer.concat([Buffer.alloc(16), idLength, this.credentialId, coseKey]);
-    const attestationObject = isoCBOR.encode(
-      new Map<string, unknown>([
-        ["fmt", "none"],
-        ["attStmt", new Map()],
-        ["authData", this.authData(0x45, attested)],
-      ]) as any,
-    );
-    return {
-      id: b64url(this.credentialId),
-      rawId: b64url(this.credentialId),
-      type: "public-key",
-      response: {
-        clientDataJSON: b64url(this.clientData("webauthn.create", options.challenge)),
-        attestationObject: b64url(attestationObject),
-        transports: ["internal"],
-      },
-      clientExtensionResults: {},
-    };
-  }
-
-  get(options: any) {
-    const clientDataJSON = this.clientData("webauthn.get", options.challenge);
-    const authenticatorData = this.authData(0x05);
-    const signature = sign(
-      "sha256",
-      Buffer.concat([authenticatorData, sha256(clientDataJSON)]),
-      this.keys.privateKey,
-    );
-    return {
-      id: b64url(this.credentialId),
-      rawId: b64url(this.credentialId),
-      type: "public-key",
-      response: {
-        clientDataJSON: b64url(clientDataJSON),
-        authenticatorData: b64url(authenticatorData),
-        signature: b64url(signature),
-        userHandle: this.userHandle,
-      },
-      clientExtensionResults: {},
-    };
-  }
-}
-
 async function register(passkey: SoftPasskey, name: string) {
   const options = await call("auth/register/options", { name });
   assert.equal(options.status, 200, JSON.stringify(options.data));
@@ -116,7 +36,11 @@ async function register(passkey: SoftPasskey, name: string) {
     response: passkey.create(options.data.options),
   });
   assert.equal(verified.status, 200, JSON.stringify(verified.data));
-  return verified.data as { token: string; user: { id: string; name: string } };
+  return verified.data as {
+    token: string;
+    user: { id: string; name: string };
+    recoveryCode: string;
+  };
 }
 
 async function signIn(passkey: SoftPasskey) {
@@ -164,7 +88,8 @@ async function main() {
     session.token,
   );
   assert.equal(again.status, 400);
-  assert.equal(again.data.error, "A lT 2");
+  assert.equal(again.data.code, "A lT 2");
+  assert.equal(again.data.error, "You're already in the tree.");
 
   // Vote for the grandparent (two levels up is always votable).
   const grandparent = (await call(`id/${leaf}`)).data.nodeData.sentTreeVote as string;
@@ -197,11 +122,142 @@ async function main() {
     second.token,
   );
   assert.equal(selfMove.status, 400);
-  assert.equal(selfMove.data.error, "A mTV 5");
+  assert.equal(selfMove.data.code, "A mTV 5");
 
   const history = (await call("history")).data.steps;
   assert.equal(history.at(-1).eventName, "ChangeNameEvent");
   console.log("ok: register, sign-in, join, vote, rename; history steps =", history.length);
+
+  // Dry runs explain why actions would fail, without changing anything.
+  const checks = await call(
+    "check",
+    {
+      actions: [
+        { fn: "addDagVote", args: { recipient: grandparent } },
+        { fn: "moveTreeVote", args: { recipient: session.user.id } },
+        { fn: "changeName", args: { name: "Still Smoke" } },
+        { fn: "addDagVote", args: { recipient: session.user.id } },
+      ],
+    },
+    session.token,
+  );
+  assert.equal(checks.status, 200, JSON.stringify(checks.data));
+  const [againVote, selfMoveCheck, renameCheck, selfVote] = checks.data.results;
+  assert.deepEqual(againVote, {
+    ok: false,
+    reason: "You already give them a reputation vote.",
+    code: "A aDV 2",
+  });
+  assert.equal(selfMoveCheck.reason, "You can't move under yourself.");
+  assert.deepEqual(renameCheck, { ok: true });
+  assert.equal(selfVote.ok, false);
+  assert.equal((await call(`id/${session.user.id}`)).data.nodeData.name, "Smoke 2");
+  console.log("ok: dry-run reasons");
+
+  // Invites: a second person joins under the inviter.
+  const invite = await call("invites", {}, session.token);
+  assert.equal(invite.status, 200, JSON.stringify(invite.data));
+  const inviteInfo = await call(`invites/${invite.data.code}`);
+  assert.deepEqual(inviteInfo.data.inviter, { id: session.user.id, name: "Smoke 2" });
+  const friendKey = new SoftPasskey();
+  const friend = await register(friendKey, "Friend");
+  const friendJoin = await call(
+    "action",
+    { fn: "joinTree", args: { name: "Friend", invite: invite.data.code } },
+    friend.token,
+  );
+  assert.equal(friendJoin.status, 200, JSON.stringify(friendJoin.data));
+  assert.equal((await call(`id/${friend.user.id}`)).data.nodeData.sentTreeVote, session.user.id);
+  const reuse = await call(`invites/${invite.data.code}`);
+  assert.equal(reuse.status, 400);
+  assert.equal(reuse.data.error, "This invite has already been used.");
+  // People outside the tree can't invite.
+  const outsider = await register(new SoftPasskey(), "Outsider");
+  assert.equal((await call("invites", {}, outsider.token)).status, 400);
+  console.log("ok: invite joins under the inviter");
+
+  // Profiles show up on the node.
+  const badLink = await call("profile", { bio: "hi", link: "javascript:alert(1)" }, session.token);
+  assert.equal(badLink.status, 400);
+  const profile = await call(
+    "profile",
+    { bio: "Smoke tester", link: "https://example.com" },
+    session.token,
+  );
+  assert.equal(profile.status, 200, JSON.stringify(profile.data));
+  const withProfile = (await call(`id/${session.user.id}`)).data.nodeData;
+  assert.equal(withProfile.bio, "Smoke tester");
+  assert.equal(withProfile.link, "https://example.com");
+  console.log("ok: profile");
+
+  // Polls weighted by reputation.
+  const created = await call(
+    "polls",
+    { question: "Lunch?", options: ["Pizza", "Sushi"] },
+    session.token,
+  );
+  assert.equal(created.status, 200, JSON.stringify(created.data));
+  const pollId = created.data.poll.id;
+  assert.equal((await call(`polls/${pollId}/vote`, { option: 0 }, session.token)).status, 200);
+  assert.equal((await call(`polls/${pollId}/vote`, { option: 1 }, friend.token)).status, 200);
+  assert.equal((await call(`polls/${pollId}/vote`, { option: 0 }, outsider.token)).status, 400);
+  const graphNow = (await call("graph")).data.nodes;
+  let poll = (await call("polls", undefined, session.token)).data.polls.find(
+    (p: any) => p.id === pollId,
+  );
+  assert.equal(poll.myVote, 0);
+  assert.equal(poll.tally[0].weight, graphNow[session.user.id].currentRep);
+  assert.equal(poll.tally[1].weight, graphNow[friend.user.id].currentRep);
+  assert.equal((await call(`polls/${pollId}/close`, {}, friend.token)).status, 400);
+  const closed = await call(`polls/${pollId}/close`, {}, session.token);
+  assert.equal(closed.status, 200, JSON.stringify(closed.data));
+  assert.ok(closed.data.poll.closedAt);
+  assert.equal((await call(`polls/${pollId}/vote`, { option: 1 }, session.token)).status, 400);
+  console.log("ok: reputation-weighted poll");
+
+  // A second passkey for the same account.
+  const addOptions = await call("auth/passkeys/options", {}, session.token);
+  assert.equal(addOptions.status, 200, JSON.stringify(addOptions.data));
+  const laptop = new SoftPasskey();
+  const added = await call(
+    "auth/passkeys/verify",
+    { flowId: addOptions.data.flowId, response: laptop.create(addOptions.data.options) },
+    session.token,
+  );
+  assert.equal(added.status, 200, JSON.stringify(added.data));
+  assert.equal((await signIn(laptop)).user.id, session.user.id);
+  console.log("ok: second passkey");
+
+  // Recovery: the code registers a new passkey and is then replaced.
+  const recoverOptions = await call("auth/recover/options", { code: session.recoveryCode });
+  assert.equal(recoverOptions.status, 200, JSON.stringify(recoverOptions.data));
+  const newPhone = new SoftPasskey();
+  const recovered = await call("auth/recover/verify", {
+    flowId: recoverOptions.data.flowId,
+    response: newPhone.create(recoverOptions.data.options),
+  });
+  assert.equal(recovered.status, 200, JSON.stringify(recovered.data));
+  assert.equal(recovered.data.user.id, session.user.id);
+  assert.notEqual(recovered.data.recoveryCode, session.recoveryCode);
+  assert.equal(
+    (await call("auth/recover/options", { code: session.recoveryCode })).status,
+    401,
+  );
+  assert.equal((await signIn(newPhone)).user.id, session.user.id);
+  console.log("ok: recovery code");
+
+  // Admin log download.
+  assert.equal((await call("admin/log")).status, 401);
+  const adminToken = process.env.ADMIN_TOKEN;
+  if (adminToken) {
+    const res = await fetch(`${backend}admin/log`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    assert.equal(res.status, 200);
+    const lines = (await res.text()).trim().split("\n");
+    assert.ok(lines.length > 10);
+    console.log("ok: admin log,", lines.length, "entries");
+  }
 }
 
 main().catch((e) => {

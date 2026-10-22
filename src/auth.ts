@@ -2,6 +2,10 @@
 // creates a user with a fresh 20-byte hex id, which is used in the tree exactly
 // like an address was. Sessions are stateless HMAC-signed bearer tokens.
 //
+// Signed-in users can add more passkeys (other devices). Each account also has a
+// recovery code, shown once, which can register a new passkey if all devices
+// are lost; using it issues a fresh code.
+//
 // Config (env):
 //   RP_ID          the site's domain the passkeys are bound to (default localhost)
 //   RP_NAME        shown by the authenticator (default Anthill)
@@ -10,7 +14,13 @@
 //   SESSION_SECRET HMAC key for session tokens (default: generated once and
 //                  kept in the data dir)
 
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
 import {
   type AuthenticationResponseJSON,
   generateAuthenticationOptions,
@@ -36,7 +46,8 @@ export class AuthError extends Error {}
 type PendingChallenge = {
   challenge: string;
   expires: number;
-  // set for registrations
+  kind: "register" | "login" | "add" | "recover";
+  // the account a new passkey is for (all kinds but login)
   user?: StoredUser;
 };
 
@@ -51,27 +62,79 @@ export class PasskeyAuth {
   }
 
   async registrationOptions(name: string) {
-    const user: StoredUser = { id: newUserId(), name };
+    return this.newPasskeyOptions({ id: newUserId(), name }, "register");
+  }
+
+  // Creates the account. Returns the session and the account's recovery code,
+  // which is shown to the user once.
+  async verifyRegistration(flowId: string, response: RegistrationResponseJSON) {
+    const pending = this.take(flowId, "register");
+    const user = pending.user!;
+    const passkey = await this.verifyNewPasskey(pending, response);
+    this.store.addPasskey(user, passkey);
+    return { ...this.session(user), recoveryCode: this.newRecoveryCode(user) };
+  }
+
+  // Another passkey for the signed-in user (e.g. a second device).
+  async addPasskeyOptions(user: StoredUser) {
+    return this.newPasskeyOptions(user, "add");
+  }
+
+  async verifyAddPasskey(user: StoredUser, flowId: string, response: RegistrationResponseJSON) {
+    const pending = this.take(flowId, "add");
+    if (pending.user?.id !== user.id) {
+      throw new AuthError("this passkey was started for another account");
+    }
+    this.store.addPasskeyToUser(await this.verifyNewPasskey(pending, response));
+    return { ok: true };
+  }
+
+  // Lost every passkey: the recovery code lets you register a new one.
+  async recoveryOptions(code: string) {
+    const user = this.store.userByRecoveryHash(hashRecoveryCode(code));
+    if (user === undefined) {
+      throw new AuthError("That recovery code isn't valid.");
+    }
+    return this.newPasskeyOptions(user, "recover");
+  }
+
+  async verifyRecovery(flowId: string, response: RegistrationResponseJSON) {
+    const pending = this.take(flowId, "recover");
+    const user = pending.user!;
+    this.store.addPasskeyToUser(await this.verifyNewPasskey(pending, response));
+    // the used code is replaced
+    return { ...this.session(user), recoveryCode: this.newRecoveryCode(user) };
+  }
+
+  // Issues a new recovery code for the user; the previous one stops working.
+  newRecoveryCode(user: StoredUser): string {
+    const code = newRecoveryCode();
+    this.store.setRecoveryHash(user.id, hashRecoveryCode(code));
+    return code;
+  }
+
+  private async newPasskeyOptions(user: StoredUser, kind: "register" | "add" | "recover") {
     const options = await generateRegistrationOptions({
       rpName,
       rpID,
-      userName: name,
+      userName: user.name,
       userID: new Uint8Array(Buffer.from(user.id.slice(2), "hex")),
       attestationType: "none",
+      excludeCredentials: this.store
+        .passkeysOf(user.id)
+        .map((p) => ({ id: p.id, transports: p.transports })),
       authenticatorSelection: {
         residentKey: "required",
         userVerification: "preferred",
       },
     });
-    return { flowId: this.remember(options.challenge, user), options };
+    return { flowId: this.remember(options.challenge, kind, user), options };
   }
 
-  async verifyRegistration(flowId: string, response: RegistrationResponseJSON) {
-    const pending = this.take(flowId);
-    const user = pending.user;
-    if (user === undefined) {
-      throw new AuthError("not a registration");
-    }
+  private async verifyNewPasskey(
+    pending: PendingChallenge,
+    response: RegistrationResponseJSON,
+  ): Promise<StoredPasskey> {
     const verification = await verifyRegistrationResponse({
       response,
       expectedChallenge: pending.challenge,
@@ -84,14 +147,16 @@ export class PasskeyAuth {
       throw new AuthError("passkey not verified");
     }
     const { credential } = verification.registrationInfo;
-    this.store.addPasskey(user, {
+    if (this.store.passkey(credential.id) !== undefined) {
+      throw new AuthError("this passkey is already registered");
+    }
+    return {
       id: credential.id,
-      userId: user.id,
+      userId: pending.user!.id,
       publicKey: Buffer.from(credential.publicKey).toString("base64url"),
       counter: credential.counter,
       transports: credential.transports,
-    });
-    return this.session(user);
+    };
   }
 
   async authenticationOptions() {
@@ -101,11 +166,11 @@ export class PasskeyAuth {
       rpID,
       userVerification: "preferred",
     });
-    return { flowId: this.remember(options.challenge), options };
+    return { flowId: this.remember(options.challenge, "login"), options };
   }
 
   async verifyAuthentication(flowId: string, response: AuthenticationResponseJSON) {
-    const pending = this.take(flowId);
+    const pending = this.take(flowId, "login");
     const passkey = this.store.passkey(response.id);
     if (passkey === undefined) {
       throw new AuthError("unknown passkey");
@@ -165,20 +230,20 @@ export class PasskeyAuth {
     return createHmac("sha256", this.secret).update(payload).digest("base64url");
   }
 
-  private remember(challenge: string, user?: StoredUser) {
+  private remember(challenge: string, kind: PendingChallenge["kind"], user?: StoredUser) {
     const now = Date.now();
     for (const [id, p] of this.pending) {
       if (p.expires < now) this.pending.delete(id);
     }
     const flowId = randomUUID();
-    this.pending.set(flowId, { challenge, user, expires: now + CHALLENGE_TTL_MS });
+    this.pending.set(flowId, { challenge, kind, user, expires: now + CHALLENGE_TTL_MS });
     return flowId;
   }
 
-  private take(flowId: string): PendingChallenge {
+  private take(flowId: string, kind: PendingChallenge["kind"]): PendingChallenge {
     const pending = this.pending.get(flowId);
     this.pending.delete(flowId);
-    if (pending === undefined || pending.expires < Date.now()) {
+    if (pending === undefined || pending.expires < Date.now() || pending.kind !== kind) {
       throw new AuthError("sign-in expired, try again");
     }
     return pending;
@@ -187,6 +252,20 @@ export class PasskeyAuth {
 
 function newUserId() {
   return `0x${randomBytes(20).toString("hex")}`;
+}
+
+// 120 random bits as six groups of four base32 characters, e.g.
+// K7QM-2XPA-....
+const BASE32 = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no I, O, 0, 1
+function newRecoveryCode() {
+  const bytes = randomBytes(24);
+  const chars = Array.from(bytes, (b) => BASE32[b % 32]).join("");
+  return chars.match(/.{4}/g)!.join("-");
+}
+
+function hashRecoveryCode(code: string) {
+  const normalised = code.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return createHash("sha256").update(normalised).digest("hex");
 }
 
 function credentialOf(passkey: StoredPasskey) {

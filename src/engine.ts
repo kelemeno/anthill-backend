@@ -133,6 +133,18 @@ export class AnthillEngine {
     return emitted;
   }
 
+  // Run a call and always roll it back: a dry run that throws exactly when the
+  // real call would.
+  simulate(call: (engine: AnthillEngine) => void) {
+    const backup = structuredClone(this.s);
+    try {
+      call(this);
+    } finally {
+      this.s = backup;
+      this.events = [];
+    }
+  }
+
   ////////////////////////////////////////////
   //// Storage helpers (mapping reads default to zero, like Solidity)
 
@@ -783,6 +795,19 @@ export class AnthillEngine {
 
   isInTree(voter: string): boolean {
     return this.sentTree(voter) !== address0;
+  }
+
+  // Not in the contract: the voter's children in tree order.
+  children(voter: string): string[] {
+    const count = this.recTreeCount(voter);
+    return Array.from({ length: count }, (_, i) => this.recTree(voter, i));
+  }
+
+  // Not in the contract: whether `voter` already votes for `recipient`, and
+  // whether they could (votable = recipient is local and higher).
+  dagVoteState(voter: string, recipient: string) {
+    const [votable, voted] = this.findSentDagVote(voter, recipient);
+    return { votable, voted };
   }
 
   ////////////////////////////////////////////

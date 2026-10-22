@@ -23,3 +23,10 @@ services:
         value: anthilldao.dev
       - key: ORIGINS
         value: https://anthilldao.dev
+      # admin endpoints (log download for backups, bootstrap invites); Render
+      # generates the value, copy it from the dashboard when you need it
+      - key: ADMIN_TOKEN
+        generateValue: true
+      # set to "true" once real members can invite everyone else
+      - key: INVITE_ONLY
+        value: "false"
