@@ -31,8 +31,8 @@ async function main() {
     flowId: options.flowId,
     response: passkey.create(options.options),
   });
-  const leaf = (await (await fetch(`${backend}randomLeaf`)).json()).randomLeaf;
-  await post("action", { fn: "joinTree", args: { name, recipient: leaf } }, session.token);
+  const leaf = (await (await fetch(`${backend}c/commons/graph`)).json()).randomLeaf;
+  await post("c/commons/action", { fn: "joinTree", args: { name, recipient: leaf } }, session.token);
   console.log(JSON.stringify({ token: session.token, user: session.user }));
 }
 

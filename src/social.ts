@@ -1,8 +1,10 @@
 // Polls weighted by reputation, and short member profiles. Both live in the
 // append-only log next to the tree actions.
 //
-// A poll's weight per option is the sum of its voters' current reputation, so
-// open polls move as reputation changes; closing a poll freezes the tally.
+// Polls belong to a community: only its members create and vote in them, and a
+// poll's weight per option is the sum of its voters' current reputation there,
+// so open polls move as reputation changes; closing a poll freezes the tally.
+// Profiles belong to the account and show in every community.
 
 import { randomBytes } from "node:crypto";
 import { ActionError } from "./offchain";
@@ -26,19 +28,18 @@ export type PollView = {
   myVote?: number;
 };
 
-export class Community {
+// One community's polls.
+export class Polls {
   constructor(
     private store: Store,
+    private community: string,
     private isMember: (id: string) => boolean,
     private reputationOf: (id: string) => bigint,
   ) {}
 
-  ////////////////////////////////////////////
-  //// polls
-
   listPolls(viewer?: string): PollView[] {
     return this.store
-      .polls()
+      .polls(this.community)
       .map((poll) => this.view(poll, viewer))
       .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   }
@@ -68,7 +69,7 @@ export class Community {
       );
     }
     const id = randomBytes(8).toString("hex");
-    this.store.addPoll(id, by, question.trim(), cleaned);
+    this.store.addPoll(this.community, id, by, question.trim(), cleaned);
     return this.view(this.store.poll(id)!, by);
   }
 
@@ -102,7 +103,9 @@ export class Community {
 
   private openPoll(pollId: string): Poll {
     const poll = this.store.poll(pollId);
-    if (poll === undefined) throw new ActionError("That poll doesn't exist.");
+    if (poll === undefined || poll.community !== this.community) {
+      throw new ActionError("That poll doesn't exist.");
+    }
     if (poll.closed !== undefined) throw new ActionError("That poll is closed.");
     return poll;
   }
@@ -135,37 +138,34 @@ export class Community {
     };
   }
 
-  ////////////////////////////////////////////
-  //// profiles
-
-  setProfile(userId: string, body: unknown): Profile {
-    const { bio = "", link = "" } = (body ?? {}) as { bio?: unknown; link?: unknown };
-    if (typeof bio !== "string" || bio.trim().length > MAX_BIO) {
-      throw new ActionError(`The bio can be at most ${MAX_BIO} characters.`);
-    }
-    if (typeof link !== "string" || link.trim().length > MAX_LINK) {
-      throw new ActionError(`The link can be at most ${MAX_LINK} characters.`);
-    }
-    const trimmedLink = link.trim();
-    if (trimmedLink !== "") {
-      let url: URL;
-      try {
-        url = new URL(trimmedLink);
-      } catch {
-        throw new ActionError("The link must be a full web address, like https://example.com.");
-      }
-      if (url.protocol !== "https:" && url.protocol !== "http:") {
-        throw new ActionError("The link must start with https://.");
-      }
-    }
-    const profile = { bio: bio.trim(), link: trimmedLink };
-    this.store.setProfile(userId, profile);
-    return profile;
-  }
-
   private requireMember(id: string, what: string) {
     if (!this.isMember(id)) {
-      throw new ActionError(`Join the tree first to ${what}.`);
+      throw new ActionError(`Join the community first to ${what}.`);
     }
   }
+}
+
+export function setProfile(store: Store, userId: string, body: unknown): Profile {
+  const { bio = "", link = "" } = (body ?? {}) as { bio?: unknown; link?: unknown };
+  if (typeof bio !== "string" || bio.trim().length > MAX_BIO) {
+    throw new ActionError(`The bio can be at most ${MAX_BIO} characters.`);
+  }
+  if (typeof link !== "string" || link.trim().length > MAX_LINK) {
+    throw new ActionError(`The link can be at most ${MAX_LINK} characters.`);
+  }
+  const trimmedLink = link.trim();
+  if (trimmedLink !== "") {
+    let url: URL;
+    try {
+      url = new URL(trimmedLink);
+    } catch {
+      throw new ActionError("The link must be a full web address, like https://example.com.");
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      throw new ActionError("The link must start with https://.");
+    }
+  }
+  const profile = { bio: bio.trim(), link: trimmedLink };
+  store.setProfile(userId, profile);
+  return profile;
 }

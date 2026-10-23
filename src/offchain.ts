@@ -1,23 +1,42 @@
-// Off-chain mode: the engine (a port of the contract) holds the tree, the
-// append-only store makes it durable, and signed-in passkey users act as
-// voters. This replaces the chain + wallet: the server checks who is acting and
-// the engine enforces the same rules the contract did.
+// Off-chain mode: an engine (a port of the contract) holds each community's
+// tree, the append-only store makes it durable, and signed-in passkey users act
+// as voters. This replaces the chain + wallet: the server checks who is acting
+// and the engine enforces the same rules the contract did.
+//
+// Communities are independent trees sharing one set of accounts. Anyone signed
+// in can start one and becomes its root. Public communities can be seen by
+// everyone; private ones only by their members.
 //
 // Joining: with an invite code, the newcomer is placed under the inviter (or
-// the nearest free spot below them). INVITE_ONLY=true makes an invite
-// required; otherwise anyone can still join under any node with a free spot.
+// the nearest free spot below them). In a community whose join policy is
+// "invite" (always the case for private ones) an invite is required; otherwise
+// anyone can join under any node with a free spot.
 
 import { randomBytes } from "node:crypto";
 import { AnthillEngine, type EngineEvent, Revert } from "./engine";
 import { explain } from "./reasons";
-import type { Action, ActionEntry, Invite, Store } from "./store";
+import {
+  type Action,
+  type ActionEntry,
+  type CommunityInfo,
+  type CommunitySettings,
+  communityOf,
+  DEFAULT_COMMUNITY,
+  type Invite,
+  type Store,
+  type StoredUser,
+} from "./store";
 
-const MAX_NAME_LENGTH = 40;
+export const MAX_NAME_LENGTH = 40;
 const MAX_WEIGHT = 100n;
 const INVITE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_OPEN_INVITES = 10;
-
-export const inviteOnly = process.env.INVITE_ONLY === "true";
+const MAX_COMMUNITY_NAME = 60;
+const MAX_DESCRIPTION = 280;
+const MAX_COMMUNITIES_PER_FOUNDER = 10;
+// Lowercase letters, digits and dashes, 3-32 long; used in URLs (/c/<id>).
+const COMMUNITY_ID = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
+const RESERVED_IDS = new Set(["admin", "api", "c", "new", "p", "invite", "settings", "www"]);
 
 export class ActionError extends Error {
   constructor(
@@ -30,31 +49,31 @@ export class ActionError extends Error {
 
 export type CheckResult = { ok: true } | { ok: false; reason: string; code?: string };
 
+export type Executed = { tree: OffchainTree; entry: ActionEntry; events: EngineEvent[] };
+
+// One community's tree.
 export class OffchainTree {
   readonly engine = new AnthillEngine();
 
-  constructor(private store: Store) {}
+  constructor(
+    private store: Store,
+    readonly id: string,
+  ) {}
 
-  // Rebuild the engine from the log. Calls onReplayed after each replayed action
-  // (used to rebuild history).
-  async load(onReplayed: (entry: ActionEntry, events: EngineEvent[]) => Promise<void>) {
-    const seed = this.store.seed;
-    if (seed !== undefined) {
-      this.engine.loadFromGraph(seed);
-    }
-    for (const entry of this.store.actions) {
-      try {
-        const events = this.engine.run((e) => apply(e, entry.by, entry.action));
-        await onReplayed(entry, events);
-      } catch (e) {
-        // Only happens if the engine's rules changed since the action was taken.
-        console.warn("replay: skipping action that now fails", entry, e);
-      }
-    }
+  get info(): CommunityInfo {
+    return this.store.community(this.id)!;
+  }
+
+  // Whether `viewer` (a user id, or undefined when signed out) may see this
+  // community: anyone for public ones, members and the founder for private.
+  visibleTo(viewer: string | undefined): boolean {
+    const { visibility, createdBy } = this.info;
+    if (visibility === "public") return true;
+    return viewer !== undefined && (viewer === createdBy || this.engine.isInTree(viewer));
   }
 
   // Validate, run and persist one action by a signed-in user.
-  execute(by: string, body: unknown): { entry: ActionEntry; events: EngineEvent[] } {
+  execute(by: string, body: unknown): Executed {
     const action = this.prepare(by, parseAction(body));
     let events: EngineEvent[];
     try {
@@ -62,7 +81,12 @@ export class OffchainTree {
     } catch (e) {
       throw this.toActionError(by, action, e);
     }
-    return { entry: this.store.appendAction(by, action), events };
+    return { tree: this, entry: this.store.appendAction(this.id, by, action), events };
+  }
+
+  // Run an action from the log again (on startup).
+  replay(entry: ActionEntry): EngineEvent[] {
+    return this.engine.run((e) => apply(e, entry.by, entry.action));
   }
 
   // Dry-run actions without changing anything: whether each would succeed, and
@@ -102,7 +126,7 @@ export class OffchainTree {
     if (!this.engine.isInTree(by)) {
       throw new ActionError("Join the tree first, then you can invite people.");
     }
-    if (this.store.openInvitesBy(by).length >= MAX_OPEN_INVITES) {
+    if (this.store.openInvitesBy(this.id, by).length >= MAX_OPEN_INVITES) {
       throw new ActionError(
         `You already have ${MAX_OPEN_INVITES} unused invites. Wait until some are used or expire.`,
       );
@@ -125,6 +149,7 @@ export class OffchainTree {
       under,
       expires: new Date(Date.now() + INVITE_TTL_MS).toISOString(),
     };
+    if (this.id !== DEFAULT_COMMUNITY) invite.community = this.id;
     this.store.addInvite(invite);
     return invite;
   }
@@ -132,7 +157,7 @@ export class OffchainTree {
   // Throws an ActionError explaining why the invite can't be used.
   validInvite(code: string): Invite {
     const invite = this.store.invite(code);
-    if (invite === undefined) {
+    if (invite === undefined || communityOf(invite) !== this.id) {
       throw new ActionError("This invite link isn't valid.");
     }
     if (invite.usedBy !== undefined) {
@@ -161,13 +186,23 @@ export class OffchainTree {
 
   ////////////////////////////////////////////
 
-  // Resolve invite placement and enforce INVITE_ONLY before the engine runs.
+  // Resolve invite placement and enforce the join policy before the engine
+  // runs.
   private prepare(by: string, action: Action): Action {
+    const { joinPolicy, createdBy } = this.info;
+    if (action.fn === "joinTreeAsRoot") {
+      // Only possible in an empty tree (the engine checks that). Restarting an
+      // invite-only community that everyone left is up to its founder.
+      if (joinPolicy === "invite" && by !== createdBy) {
+        throw new ActionError("Only the founder can restart this community.");
+      }
+      return action;
+    }
     if (action.fn !== "joinTree") return action;
     const { invite } = action.args;
     if (invite === undefined) {
-      if (inviteOnly) {
-        throw new ActionError("Joining needs an invite from someone in the tree.");
+      if (joinPolicy === "invite") {
+        throw new ActionError("Joining needs an invite from someone in the community.");
       }
       return action;
     }
@@ -197,6 +232,126 @@ export class OffchainTree {
     }
     return e;
   }
+}
+
+// All communities' trees, rebuilt from the log on startup.
+export class Communities {
+  private trees = new Map<string, OffchainTree>();
+
+  constructor(private store: Store) {
+    for (const { id } of store.communities()) {
+      this.trees.set(id, new OffchainTree(store, id));
+    }
+  }
+
+  get(id: string): OffchainTree | undefined {
+    return this.trees.get(id);
+  }
+
+  all(): OffchainTree[] {
+    return [...this.trees.values()];
+  }
+
+  // Rebuild the engines from the log. Calls onReplayed after each replayed
+  // action (used to rebuild history).
+  async load(onReplayed: (executed: Executed) => Promise<void>) {
+    const seed = this.store.seed;
+    if (seed !== undefined) {
+      this.trees.get(DEFAULT_COMMUNITY)!.engine.loadFromGraph(seed);
+    }
+    for (const entry of this.store.actions) {
+      const tree = this.trees.get(communityOf(entry));
+      let events: EngineEvent[];
+      try {
+        if (tree === undefined) throw new Error("no such community");
+        events = tree.replay(entry);
+      } catch (e) {
+        // Only happens if the engine's rules changed since the action was taken.
+        console.warn("replay: skipping action that now fails", entry, e);
+        continue;
+      }
+      await onReplayed({ tree, entry, events });
+    }
+  }
+
+  // Start a community; its founder becomes the root of its tree.
+  create(founder: StoredUser, body: unknown): Executed {
+    const { id: rawId, ...rest } = (body ?? {}) as { id?: unknown };
+    const id = typeof rawId === "string" ? rawId.trim().toLowerCase() : "";
+    if (!COMMUNITY_ID.test(id) || RESERVED_IDS.has(id)) {
+      throw new ActionError(
+        "The address must be 3-32 lowercase letters, digits or dashes, starting and ending with a letter or digit.",
+      );
+    }
+    if (this.trees.has(id)) {
+      throw new ActionError("That address is taken. Try another one.");
+    }
+    const founded = this.store.communities().filter((c) => c.createdBy === founder.id);
+    if (founded.length >= MAX_COMMUNITIES_PER_FOUNDER) {
+      throw new ActionError(`You can start at most ${MAX_COMMUNITIES_PER_FOUNDER} communities.`);
+    }
+    const settings = parseSettings(rest);
+    this.store.addCommunity({
+      id,
+      ...settings,
+      createdBy: founder.id,
+      createdAt: new Date().toISOString(),
+    });
+    const tree = new OffchainTree(this.store, id);
+    this.trees.set(id, tree);
+    return tree.execute(founder.id, { fn: "joinTreeAsRoot", args: { name: founder.name } });
+  }
+
+  // Change a community's name, description, visibility or join policy.
+  updateSettings(by: string, tree: OffchainTree, body: unknown): CommunityInfo {
+    if (by !== tree.info.createdBy) {
+      throw new ActionError("Only the founder can change the community's settings.");
+    }
+    this.store.updateCommunity(tree.id, parseSettings(body));
+    return tree.info;
+  }
+
+  // Rename an account, and its node in every tree it's in.
+  rename(user: StoredUser, body: unknown): Executed[] {
+    const name = parseName((body as { name?: unknown } | null)?.name);
+    this.store.setUserName(user.id, name);
+    return this.all()
+      .filter((tree) => tree.engine.isInTree(user.id))
+      .map((tree) => tree.execute(user.id, { fn: "changeName", args: { name } }));
+  }
+}
+
+function parseSettings(body: unknown): CommunitySettings {
+  const { name, description = "", visibility, joinPolicy } = (body ?? {}) as Record<
+    string,
+    unknown
+  >;
+  if (typeof name !== "string" || name.trim() === "" || name.trim().length > MAX_COMMUNITY_NAME) {
+    throw new ActionError(`The name must be 1-${MAX_COMMUNITY_NAME} characters.`);
+  }
+  if (typeof description !== "string" || description.trim().length > MAX_DESCRIPTION) {
+    throw new ActionError(`The description can be at most ${MAX_DESCRIPTION} characters.`);
+  }
+  if (visibility !== "public" && visibility !== "private") {
+    throw new ActionError("Choose whether the community is public or private.");
+  }
+  if (joinPolicy !== "open" && joinPolicy !== "invite") {
+    throw new ActionError("Choose whether anyone can join or only people with an invite.");
+  }
+  return {
+    name: name.trim(),
+    description: description.trim(),
+    visibility,
+    // nobody outside a private community can see where to join
+    joinPolicy: visibility === "private" ? "invite" : joinPolicy,
+  };
+}
+
+function parseName(v: unknown): string {
+  if (typeof v !== "string" || v.trim() === "" || v.trim().length > MAX_NAME_LENGTH) {
+    throw new ActionError(`Names must be 1-${MAX_NAME_LENGTH} characters.`);
+  }
+  return v.trim();
 }
 
 function apply(engine: AnthillEngine, voter: string, action: Action) {
@@ -234,13 +389,7 @@ function parseAction(body: unknown): Action {
     }
     return v.toLowerCase();
   };
-  const name = () => {
-    const v = args.name;
-    if (typeof v !== "string" || v.trim() === "" || v.trim().length > MAX_NAME_LENGTH) {
-      throw new ActionError(`Names must be 1-${MAX_NAME_LENGTH} characters.`);
-    }
-    return v.trim();
-  };
+  const name = () => parseName(args.name);
 
   switch (fn) {
     case "joinTree": {
