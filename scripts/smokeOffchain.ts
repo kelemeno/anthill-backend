@@ -1,6 +1,8 @@
 // End-to-end smoke test of off-chain mode: drives a running backend with a
 // software passkey (P-256, "none" attestation) the way a browser would.
-// Registers, signs in, joins, votes, renames, checks why actions fail, invites
+// Checks the commons starts empty and only its founder can start it. In the
+// demo (the seeded tree): registers, signs in, joins, votes, renames, checks
+// why actions fail, invites
 // a second user, sets a profile, runs a poll, starts public and private
 // communities (joining, invites, privacy, settings, renaming across them, an
 // emptied tree), adds a second passkey, recovers with the recovery code and
@@ -55,12 +57,31 @@ async function signIn(passkey: SoftPasskey) {
   return verified.data as { token: string; user: { id: string; name: string } };
 }
 
-// A node as served in a community's graph (the default one without `cid`).
-async function nodeOf(id: string, cid?: string) {
-  return (await call(cid ? `c/${cid}/graph` : "graph")).data.nodes[id];
+// The seeded tree is the demo community (invite only); the commons starts
+// empty and only its founder can start its tree.
+const D = "c/demo/";
+
+// A node as served in a community's graph.
+async function nodeOf(id: string, cid = "demo") {
+  return (await call(`c/${cid}/graph`)).data.nodes[id];
+}
+
+async function adminInvite(community: string, under: string) {
+  const res = await fetch(`${backend}admin/invites`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.ADMIN_TOKEN}`,
+    },
+    body: JSON.stringify({ community, under }),
+  });
+  assert.equal(res.status, 200);
+  return ((await res.json()) as { code: string }).code;
 }
 
 async function main() {
+  assert.ok(process.env.ADMIN_TOKEN, "set ADMIN_TOKEN (the backend's) to run this");
+
   // Not signed in: actions are refused.
   assert.equal((await call("action", { fn: "leaveTree" })).status, 401);
 
@@ -75,11 +96,27 @@ async function main() {
   const forged = `${session.token.split(".")[0]}.AAAA`;
   assert.equal((await call("auth/me", undefined, forged)).status, 401);
 
-  // Join under a leaf.
-  const leaf = (await call("graph")).data.randomLeaf as string;
-  const join = await call(
-    "action",
+  // The commons is empty, and only its founder can start it.
+  const commons = (await call("graph")).data;
+  assert.equal(commons.community.id, "commons");
+  assert.deepEqual(commons.nodes, {});
+  const notFounder = await call("action", { fn: "joinTreeAsRoot", args: { name: "Smoke" } }, session.token);
+  assert.equal(notFounder.status, 400);
+  assert.match(notFounder.data.error, /founder/);
+
+  // The demo (the seeded tree) is invite only: join under a leaf with an
+  // admin invite.
+  const leaf = (await call(`${D}graph`)).data.randomLeaf as string;
+  const uninvited = await call(
+    `${D}action`,
     { fn: "joinTree", args: { name: "Smoke", recipient: leaf } },
+    session.token,
+  );
+  assert.equal(uninvited.status, 400);
+  const leafInvite = await adminInvite("demo", leaf);
+  const join = await call(
+    `${D}action`,
+    { fn: "joinTree", args: { name: "Smoke", invite: leafInvite } },
     session.token,
   );
   assert.equal(join.status, 200, JSON.stringify(join.data));
@@ -90,8 +127,8 @@ async function main() {
 
   // Joining twice is refused by the contract rules.
   const again = await call(
-    "action",
-    { fn: "joinTree", args: { name: "Smoke", recipient: leaf } },
+    `${D}action`,
+    { fn: "joinTree", args: { name: "Smoke", invite: await adminInvite("demo", leaf) } },
     session.token,
   );
   assert.equal(again.status, 400);
@@ -101,7 +138,7 @@ async function main() {
   // Vote for the grandparent (two levels up is always votable).
   const grandparent = (await nodeOf(leaf)).sentTreeVote as string;
   const vote = await call(
-    "action",
+    `${D}action`,
     { fn: "addDagVote", args: { recipient: grandparent, weight: "1" } },
     session.token,
   );
@@ -110,34 +147,33 @@ async function main() {
   // Sign in again with the same passkey, rename with the new session.
   const second = await signIn(passkey);
   assert.equal(second.user.id, session.user.id);
-  const rename = await call("action", { fn: "changeName", args: { name: "Smoke 2" } }, second.token);
+  const rename = await call(`${D}action`, { fn: "changeName", args: { name: "Smoke 2" } }, second.token);
   assert.equal(rename.status, 200, JSON.stringify(rename.data));
 
   node = (await nodeOf(session.user.id));
   assert.equal(node.name, "Smoke 2");
 
-  // The default community answers at /c/commons too.
-  const graph = (await call("c/commons/graph")).data;
+  const graph = (await call(`${D}graph`)).data;
   assert.deepEqual(graph.nodes[session.user.id], node);
-  assert.equal(graph.community.id, "commons");
+  assert.equal(graph.community.id, "demo");
   assert.deepEqual(node.sentDagVotes.map((v: any) => v.id).sort(), [leaf, grandparent].sort());
 
   // Moving under yourself is refused (it used to detach the voter into a loop).
   const selfMove = await call(
-    "action",
+    `${D}action`,
     { fn: "moveTreeVote", args: { recipient: session.user.id } },
     second.token,
   );
   assert.equal(selfMove.status, 400);
   assert.equal(selfMove.data.code, "A mTV 5");
 
-  const history = (await call("history")).data.steps;
+  const history = (await call(`${D}history`)).data.steps;
   assert.equal(history.at(-1).eventName, "ChangeNameEvent");
   console.log("ok: register, sign-in, join, vote, rename; history steps =", history.length);
 
   // Dry runs explain why actions would fail, without changing anything.
   const checks = await call(
-    "check",
+    `${D}check`,
     {
       actions: [
         { fn: "addDagVote", args: { recipient: grandparent } },
@@ -162,14 +198,14 @@ async function main() {
   console.log("ok: dry-run reasons");
 
   // Invites: a second person joins under the inviter.
-  const invite = await call("invites", {}, session.token);
+  const invite = await call(`${D}invites`, {}, session.token);
   assert.equal(invite.status, 200, JSON.stringify(invite.data));
   const inviteInfo = await call(`invites/${invite.data.code}`);
   assert.deepEqual(inviteInfo.data.inviter, { id: session.user.id, name: "Smoke 2" });
   const friendKey = new SoftPasskey();
   const friend = await register(friendKey, "Friend");
   const friendJoin = await call(
-    "action",
+    `${D}action`,
     { fn: "joinTree", args: { name: "Friend", invite: invite.data.code } },
     friend.token,
   );
@@ -180,7 +216,7 @@ async function main() {
   assert.equal(reuse.data.error, "This invite has already been used.");
   // People outside the tree can't invite.
   const outsider = await register(new SoftPasskey(), "Outsider");
-  assert.equal((await call("invites", {}, outsider.token)).status, 400);
+  assert.equal((await call(`${D}invites`, {}, outsider.token)).status, 400);
   console.log("ok: invite joins under the inviter");
 
   // Profiles show up on the node.
@@ -199,27 +235,27 @@ async function main() {
 
   // Polls weighted by reputation.
   const created = await call(
-    "polls",
+    `${D}polls`,
     { question: "Lunch?", options: ["Pizza", "Sushi"] },
     session.token,
   );
   assert.equal(created.status, 200, JSON.stringify(created.data));
   const pollId = created.data.poll.id;
-  assert.equal((await call(`polls/${pollId}/vote`, { option: 0 }, session.token)).status, 200);
-  assert.equal((await call(`polls/${pollId}/vote`, { option: 1 }, friend.token)).status, 200);
-  assert.equal((await call(`polls/${pollId}/vote`, { option: 0 }, outsider.token)).status, 400);
-  const graphNow = (await call("graph")).data.nodes;
-  let poll = (await call("polls", undefined, session.token)).data.polls.find(
+  assert.equal((await call(`${D}polls/${pollId}/vote`, { option: 0 }, session.token)).status, 200);
+  assert.equal((await call(`${D}polls/${pollId}/vote`, { option: 1 }, friend.token)).status, 200);
+  assert.equal((await call(`${D}polls/${pollId}/vote`, { option: 0 }, outsider.token)).status, 400);
+  const graphNow = (await call(`${D}graph`)).data.nodes;
+  let poll = (await call(`${D}polls`, undefined, session.token)).data.polls.find(
     (p: any) => p.id === pollId,
   );
   assert.equal(poll.myVote, 0);
   assert.equal(poll.tally[0].weight, graphNow[session.user.id].currentRep);
   assert.equal(poll.tally[1].weight, graphNow[friend.user.id].currentRep);
-  assert.equal((await call(`polls/${pollId}/close`, {}, friend.token)).status, 400);
-  const closed = await call(`polls/${pollId}/close`, {}, session.token);
+  assert.equal((await call(`${D}polls/${pollId}/close`, {}, friend.token)).status, 400);
+  const closed = await call(`${D}polls/${pollId}/close`, {}, session.token);
   assert.equal(closed.status, 200, JSON.stringify(closed.data));
   assert.ok(closed.data.poll.closedAt);
-  assert.equal((await call(`polls/${pollId}/vote`, { option: 1 }, session.token)).status, 400);
+  assert.equal((await call(`${D}polls/${pollId}/vote`, { option: 1 }, session.token)).status, 400);
   console.log("ok: reputation-weighted poll");
 
   // Communities: a public one anyone can join.
@@ -242,7 +278,7 @@ async function main() {
   }
   assert.equal((await call("communities", { id: "x", name: "No" })).status, 401);
   const listed = (await call("communities")).data.communities.map((c: any) => c.id);
-  assert.ok(listed.includes("commons") && listed.includes("smoke-public"));
+  assert.ok(["commons", "demo", "smoke-public"].every((id) => listed.includes(id)));
 
   // Joining it under the founder; it's a separate tree.
   const clubJoin = await call(
@@ -264,10 +300,10 @@ async function main() {
     friend.token,
   );
   assert.equal(clubPoll.status, 200, JSON.stringify(clubPoll.data));
-  const commonsPolls = (await call("polls")).data.polls.map((p: any) => p.id);
-  assert.ok(!commonsPolls.includes(clubPoll.data.poll.id));
+  const demoPolls = (await call(`${D}polls`)).data.polls.map((p: any) => p.id);
+  assert.ok(!demoPolls.includes(clubPoll.data.poll.id));
   assert.equal(
-    (await call(`polls/${clubPoll.data.poll.id}/vote`, { option: 0 }, session.token)).status,
+    (await call(`${D}polls/${clubPoll.data.poll.id}/vote`, { option: 0 }, session.token)).status,
     400,
   );
   assert.equal(
@@ -350,7 +386,7 @@ async function main() {
   const renamed = await call("name", { name: "Smoke 3" }, session.token);
   assert.equal(renamed.status, 200, JSON.stringify(renamed.data));
   assert.equal((await call("auth/me", undefined, session.token)).data.user.name, "Smoke 3");
-  for (const cid of ["commons", "smoke-public", "smoke-private"]) {
+  for (const cid of ["demo", "smoke-public", "smoke-private"]) {
     const n = (await call(`c/${cid}/graph`, undefined, session.token)).data.nodes[session.user.id];
     assert.equal(n.name, "Smoke 3", cid);
   }
@@ -416,7 +452,7 @@ async function main() {
   // Admin log download.
   assert.equal((await call("admin/log")).status, 401);
   const adminToken = process.env.ADMIN_TOKEN;
-  if (adminToken) {
+  {
     const res = await fetch(`${backend}admin/log`, {
       headers: { Authorization: `Bearer ${adminToken}` },
     });

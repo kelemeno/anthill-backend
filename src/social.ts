@@ -103,7 +103,7 @@ export class Polls {
 
   private openPoll(pollId: string): Poll {
     const poll = this.store.poll(pollId);
-    if (poll === undefined || poll.community !== this.community) {
+    if (poll === undefined || this.store.communityOf(poll) !== this.community) {
       throw new ActionError("That poll doesn't exist.");
     }
     if (poll.closed !== undefined) throw new ActionError("That poll is closed.");

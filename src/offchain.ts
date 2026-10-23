@@ -20,8 +20,6 @@ import {
   type ActionEntry,
   type CommunityInfo,
   type CommunitySettings,
-  communityOf,
-  DEFAULT_COMMUNITY,
   type Invite,
   type Store,
   type StoredUser,
@@ -36,7 +34,7 @@ const MAX_DESCRIPTION = 280;
 const MAX_COMMUNITIES_PER_FOUNDER = 10;
 // Lowercase letters, digits and dashes, 3-32 long; used in URLs (/c/<id>).
 const COMMUNITY_ID = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
-const RESERVED_IDS = new Set(["admin", "api", "c", "new", "p", "invite", "settings", "www"]);
+const RESERVED_IDS = new Set(["admin", "api", "c", "demo", "new", "p", "invite", "settings", "www"]);
 
 export class ActionError extends Error {
   constructor(
@@ -145,11 +143,11 @@ export class OffchainTree {
   private storeInvite(by: string, under: string): Invite {
     const invite: Invite = {
       code: randomBytes(12).toString("base64url"),
+      community: this.id,
       by,
       under,
       expires: new Date(Date.now() + INVITE_TTL_MS).toISOString(),
     };
-    if (this.id !== DEFAULT_COMMUNITY) invite.community = this.id;
     this.store.addInvite(invite);
     return invite;
   }
@@ -157,7 +155,7 @@ export class OffchainTree {
   // Throws an ActionError explaining why the invite can't be used.
   validInvite(code: string): Invite {
     const invite = this.store.invite(code);
-    if (invite === undefined || communityOf(invite) !== this.id) {
+    if (invite === undefined || this.store.communityOf(invite) !== this.id) {
       throw new ActionError("This invite link isn't valid.");
     }
     if (invite.usedBy !== undefined) {
@@ -191,10 +189,10 @@ export class OffchainTree {
   private prepare(by: string, action: Action): Action {
     const { joinPolicy, createdBy } = this.info;
     if (action.fn === "joinTreeAsRoot") {
-      // Only possible in an empty tree (the engine checks that). Restarting an
-      // invite-only community that everyone left is up to its founder.
-      if (joinPolicy === "invite" && by !== createdBy) {
-        throw new ActionError("Only the founder can restart this community.");
+      // Only possible in an empty tree (the engine checks that). Starting it
+      // is up to the founder; without one, anyone can unless it's invite-only.
+      if (createdBy !== "" ? by !== createdBy : joinPolicy === "invite") {
+        throw new ActionError("Only the founder can start this community's tree.");
       }
       return action;
     }
@@ -257,10 +255,10 @@ export class Communities {
   async load(onReplayed: (executed: Executed) => Promise<void>) {
     const seed = this.store.seed;
     if (seed !== undefined) {
-      this.trees.get(DEFAULT_COMMUNITY)!.engine.loadFromGraph(seed);
+      this.trees.get(this.store.originalCommunity)!.engine.loadFromGraph(seed);
     }
     for (const entry of this.store.actions) {
-      const tree = this.trees.get(communityOf(entry));
+      const tree = this.trees.get(this.store.communityOf(entry));
       let events: EngineEvent[];
       try {
         if (tree === undefined) throw new Error("no such community");

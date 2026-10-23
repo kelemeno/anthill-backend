@@ -3,9 +3,12 @@
 // action, or a change to passkeys, invites, profiles or polls. On startup the
 // engines and everything else are rebuilt by replaying the log in order.
 //
-// Trees, invites and polls belong to a community; entries written before
-// communities existed have no community field and belong to the default one
-// (the original public tree). Accounts and profiles are shared by all.
+// Trees, invites and polls belong to a community. Entries written before
+// communities existed have no community field: they belong to the original
+// tree, which grew from the seed. That tree started out as the commons and was
+// later moved to a demo community (a "commonsMoved" entry), leaving the
+// commons empty for real members. Entries are always tagged now. Accounts and
+// profiles are shared by all communities.
 
 import {
   appendFileSync,
@@ -35,22 +38,18 @@ export type CommunityInfo = {
 
 export type CommunitySettings = Pick<CommunityInfo, "name" | "description" | "visibility" | "joinPolicy">;
 
-// The original tree, which every log has implicitly. Settings changes are
-// stored like any other community's.
+// The commons, which every log has implicitly. Settings changes are stored
+// like any other community's.
 function defaultCommunity(): CommunityInfo {
   return {
     id: DEFAULT_COMMUNITY,
     name: "Anthill Commons",
-    description: "The public tree everyone can explore.",
+    description: "The public community anyone can join.",
     visibility: "public",
     joinPolicy: process.env.INVITE_ONLY === "true" ? "invite" : "open",
     createdBy: "",
     createdAt: "",
   };
-}
-
-export function communityOf(entry: { community?: string }): string {
-  return entry.community ?? DEFAULT_COMMUNITY;
 }
 
 export type StoredPasskey = {
@@ -94,7 +93,8 @@ export type Profile = { bio: string; link: string };
 
 export type Poll = {
   id: string;
-  community: string;
+  // see Store.communityOf
+  community?: string;
   by: string;
   at: string;
   question: string;
@@ -109,6 +109,7 @@ type Entry =
   | { type: "seed"; at: string; graph: SeedGraph }
   | { type: "community"; at: string; community: CommunityInfo }
   | { type: "communityUpdate"; at: string; id: string; settings: CommunitySettings }
+  | { type: "commonsMoved"; at: string; to: CommunityInfo; commonsFounder: string }
   | { type: "passkey"; at: string; user: StoredUser; passkey: StoredPasskey }
   | { type: "passkeyAdded"; at: string; passkey: StoredPasskey }
   | { type: "counter"; at: string; id: string; counter: number }
@@ -140,6 +141,8 @@ export class Store {
   private pollsById = new Map<string, Poll>();
   private communityById = new Map<string, CommunityInfo>([[DEFAULT_COMMUNITY, defaultCommunity()]]);
   private seedGraph: SeedGraph | undefined;
+  // where untagged entries (the original tree) belong
+  private originalTree = DEFAULT_COMMUNITY;
   private actionEntries: ActionEntry[] = [];
 
   constructor(dir: string) {
@@ -172,10 +175,27 @@ export class Store {
   }
 
   appendAction(community: string, by: string, action: Action): ActionEntry {
-    const entry: ActionEntry = { type: "action", at: now(), by, action };
-    if (community !== DEFAULT_COMMUNITY) entry.community = community;
+    const entry: ActionEntry = { type: "action", at: now(), by, action, community };
     this.append(entry);
     return entry;
+  }
+
+  // The community an entry belongs to.
+  communityOf(entry: { community?: string }): string {
+    return entry.community ?? this.originalTree;
+  }
+
+  // The community the seed and the untagged entries belong to.
+  get originalCommunity() {
+    return this.originalTree;
+  }
+
+  // Move the original tree (the seed and everything done in it so far) to
+  // its own community, and start the commons over, empty, with a founder who
+  // starts its tree.
+  moveCommons(to: CommunityInfo, commonsFounder: string) {
+    if (this.originalTree !== DEFAULT_COMMUNITY) throw new Error("already moved");
+    this.append({ type: "commonsMoved", at: now(), to, commonsFounder });
   }
 
   ////////////////////////////////////////////
@@ -257,7 +277,10 @@ export class Store {
     const nowIso = now();
     return [...this.invites.values()].filter(
       (i) =>
-        communityOf(i) === community && i.by === by && i.usedBy === undefined && i.expires > nowIso,
+        this.communityOf(i) === community &&
+        i.by === by &&
+        i.usedBy === undefined &&
+        i.expires > nowIso,
     );
   }
 
@@ -276,9 +299,7 @@ export class Store {
   //// polls
 
   addPoll(community: string, id: string, by: string, question: string, options: string[]) {
-    const entry: Entry = { type: "poll", at: now(), id, by, question, options };
-    if (community !== DEFAULT_COMMUNITY) entry.community = community;
-    this.append(entry);
+    this.append({ type: "poll", at: now(), id, community, by, question, options });
   }
 
   votePoll(pollId: string, by: string, option: number) {
@@ -294,7 +315,7 @@ export class Store {
   }
 
   polls(community: string) {
-    return [...this.pollsById.values()].filter((p) => p.community === community);
+    return [...this.pollsById.values()].filter((p) => this.communityOf(p) === community);
   }
 
   sessionSecret(generate: () => string): string {
@@ -316,6 +337,15 @@ export class Store {
         break;
       case "community":
         this.communityById.set(entry.community.id, { ...entry.community });
+        break;
+      case "commonsMoved":
+        this.communityById.set(entry.to.id, { ...entry.to });
+        this.communityById.set(DEFAULT_COMMUNITY, {
+          ...defaultCommunity(),
+          createdBy: entry.commonsFounder,
+          createdAt: entry.at,
+        });
+        this.originalTree = entry.to.id;
         break;
       case "communityUpdate": {
         const c = this.communityById.get(entry.id);
@@ -351,7 +381,7 @@ export class Store {
       case "poll":
         this.pollsById.set(entry.id, {
           id: entry.id,
-          community: communityOf(entry),
+          community: entry.community,
           by: entry.by,
           at: entry.at,
           question: entry.question,

@@ -27,12 +27,25 @@ import { Polls, setProfile } from "./social";
 import {
   type ActionEntry,
   bigintReviver,
-  communityOf,
   DEFAULT_COMMUNITY,
   Store,
 } from "./store";
 
 type Snapshot = { graph: SeedGraph; history: History; randomLeaf: string };
+
+// The seeded tree (the original Anthill one) is a demo; the commons is for
+// real members, and starts empty. Its founder starts its tree: Kalman's
+// account, the only real person in the original tree when it moved.
+const DEMO = {
+  id: "demo",
+  name: "Anthill Demo",
+  description:
+    "The original Anthill tree, kept to show how it works: look around as any member to see where their reputation comes from.",
+  visibility: "public",
+  joinPolicy: "invite",
+  createdBy: "",
+} as const;
+const COMMONS_FOUNDER = process.env.COMMONS_FOUNDER || "0xa0d64a92e36a7c122b28bd2e4b60b96aa8bd6c3d";
 
 // What's served for one community, rebuilt after every action.
 class TreeView {
@@ -99,6 +112,10 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
     console.log("Seeding a new tree from", snapshotPath);
     store.setSeed(readSnapshot().graph);
   }
+  if (store.seed !== undefined && store.originalCommunity === DEFAULT_COMMUNITY) {
+    console.log("Moving the seeded tree to the demo community; the commons starts empty");
+    store.moveCommons({ ...DEMO, createdAt: new Date().toISOString() }, COMMONS_FOUNDER);
+  }
 
   const auth = new PasskeyAuth(store);
   const communities = new Communities(store);
@@ -128,10 +145,10 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
     return p;
   };
 
-  // The default community's history continues the snapshot's, which leads up
-  // to the seeded state.
+  // The seeded tree's history continues the snapshot's, which leads up to the
+  // seeded state.
   if (store.seed !== undefined) {
-    viewOf(communities.get(DEFAULT_COMMUNITY)!).history = readSnapshot().history;
+    viewOf(communities.get(store.originalCommunity)!).history = readSnapshot().history;
   }
 
   async function record({ tree, entry, events }: Executed) {
@@ -292,14 +309,16 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   ////////////////////////////////////////////
   //// communities
 
-  // Public communities and the private ones the viewer belongs to.
+  // Public communities and the private ones the viewer belongs to: the
+  // commons first, then the biggest.
   app.get("/communities", (c) => {
     const viewer = viewerOf(c);
+    const first = (id: string) => (id === DEFAULT_COMMUNITY ? 0 : 1);
     const list = communities
       .all()
       .filter((tree) => tree.visibleTo(viewer))
       .map((tree) => summary(tree, viewer))
-      .sort((a, b) => b.members - a.members);
+      .sort((a, b) => first(a.id) - first(b.id) || b.members - a.members);
     return c.json({ communities: list });
   });
 
@@ -368,7 +387,7 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
     const invited =
       body?.fn === "joinTree" &&
       typeof invite === "string" &&
-      communityOf(store.invite(invite) ?? { community: "" }) === tree?.id;
+      store.communityOf(store.invite(invite) ?? { community: "" }) === tree?.id;
     if (tree === undefined || !(tree.visibleTo(user.id) || invited)) {
       throw new NotFoundError();
     }
@@ -432,7 +451,8 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
 
   app.get("/invites/:code", (c) => {
     const code = param(c, "code");
-    const tree = communities.get(communityOf(store.invite(code) ?? {}));
+    const stored = store.invite(code);
+    const tree = stored && communities.get(store.communityOf(stored));
     if (tree === undefined) throw new ActionError("This invite link isn't valid.");
     const invite = tree.validInvite(code);
     return c.json({
@@ -477,7 +497,10 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
         store.actions.length,
         "actions; default tree has",
         communities.get(DEFAULT_COMMUNITY)!.engine.members().length,
-        "members",
+        "members;",
+        store.originalCommunity,
+        "has",
+        communities.get(store.originalCommunity)!.engine.members().length,
       );
     },
   };
