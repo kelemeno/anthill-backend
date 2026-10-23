@@ -20,6 +20,7 @@ import {
   findRandomLeaf,
 } from "./dagProcessing";
 import type { AnthillEngine, EngineEvent, SeedGraph } from "./engine";
+import { playDemoStory } from "./demoStory";
 import { clientIp, jsonBody, NotFoundError, rateLimit, requireAdmin } from "./http";
 import { NodeDataStoreCollapse, type NodeDataString } from "./nodeData";
 import { ActionError, Communities, type Executed, type OffchainTree } from "./offchain";
@@ -46,6 +47,8 @@ const DEMO = {
   createdBy: "",
 } as const;
 const COMMONS_FOUNDER = process.env.COMMONS_FOUNDER || "0xa0d64a92e36a7c122b28bd2e4b60b96aa8bd6c3d";
+// marks that the demo's story (demoStory.ts) has been played
+const DEMO_STORY = "demo-story-1";
 
 // What's served for one community, rebuilt after every action.
 class TreeView {
@@ -487,6 +490,21 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
 
   return {
     async start() {
+      // The demo's story (once), played on a scratch copy of the trees: its
+      // actions go to the log, and the load below replays them with the rest.
+      if (store.community(DEMO.id) !== undefined && !store.hasMigration(DEMO_STORY)) {
+        // marked first: a crash halfway leaves part of the story, not two
+        store.markMigration(DEMO_STORY);
+        const scratch = new Communities(store);
+        await scratch.load(async () => {});
+        const demo = scratch.get(DEMO.id)!;
+        const played = playDemoStory(
+          demo,
+          (under) => demo.createAdminInvite(under).code,
+          (id) => store.user(id) !== undefined,
+        );
+        console.log("Played the demo's story:", played, "actions");
+      }
       await communities.load(record);
       for (const tree of communities.all()) await viewOf(tree).rebuild(tree.engine);
       broadcast("update");

@@ -110,6 +110,8 @@ type Entry =
   | { type: "community"; at: string; community: CommunityInfo }
   | { type: "communityUpdate"; at: string; id: string; settings: CommunitySettings }
   | { type: "commonsMoved"; at: string; to: CommunityInfo; commonsFounder: string }
+  // a one-time change made on startup (e.g. the demo's story), so it isn't redone
+  | { type: "migration"; at: string; id: string }
   | { type: "passkey"; at: string; user: StoredUser; passkey: StoredPasskey }
   | { type: "passkeyAdded"; at: string; passkey: StoredPasskey }
   | { type: "counter"; at: string; id: string; counter: number }
@@ -143,6 +145,7 @@ export class Store {
   private seedGraph: SeedGraph | undefined;
   // where untagged entries (the original tree) belong
   private originalTree = DEFAULT_COMMUNITY;
+  private migrations = new Set<string>();
   private actionEntries: ActionEntry[] = [];
 
   constructor(dir: string) {
@@ -196,6 +199,15 @@ export class Store {
   moveCommons(to: CommunityInfo, commonsFounder: string) {
     if (this.originalTree !== DEFAULT_COMMUNITY) throw new Error("already moved");
     this.append({ type: "commonsMoved", at: now(), to, commonsFounder });
+  }
+
+  // One-time changes made on startup.
+  hasMigration(id: string) {
+    return this.migrations.has(id);
+  }
+
+  markMigration(id: string) {
+    this.append({ type: "migration", at: now(), id });
   }
 
   ////////////////////////////////////////////
@@ -346,6 +358,9 @@ export class Store {
           createdAt: entry.at,
         });
         this.originalTree = entry.to.id;
+        break;
+      case "migration":
+        this.migrations.add(entry.id);
         break;
       case "communityUpdate": {
         const c = this.communityById.get(entry.id);

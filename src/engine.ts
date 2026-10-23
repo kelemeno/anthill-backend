@@ -806,6 +806,16 @@ export class AnthillEngine {
     return ids;
   }
 
+  // Not in the contract: the voter's parent (address1 for the root).
+  parent(voter: string): string {
+    return this.sentTree(voter);
+  }
+
+  // Not in the contract: everyone the voter endorses.
+  endorsing(voter: string): string[] {
+    return Array.from({ length: this.sentCount(voter) }, (_, i) => this.readSent(voter, i).id);
+  }
+
   // Not in the contract: the voter's children in tree order.
   children(voter: string): string[] {
     const count = this.recTreeCount(voter);
