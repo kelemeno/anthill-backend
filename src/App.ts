@@ -360,6 +360,12 @@ function serially(fn: () => Promise<void>): Promise<void> {
   return result;
 }
 
+// Who someone could endorse (give a reputation vote to) right now.
+app.get("/people/:id/reach", (c) => {
+  const { offchain } = requireOffchain();
+  return c.json({ canEndorse: offchain.reach(c.req.param("id").toLowerCase()) });
+});
+
 //// invites
 
 app.post("/invites", (c) => {

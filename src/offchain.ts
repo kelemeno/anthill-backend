@@ -85,6 +85,16 @@ export class OffchainTree {
     });
   }
 
+  // Everyone `voter` could endorse right now but doesn't yet.
+  reach(voter: string): string[] {
+    if (!this.engine.isInTree(voter)) return [];
+    return this.engine.members().filter((m) => {
+      if (m === voter) return false;
+      const { votable, voted } = this.engine.dagVoteState(voter, m);
+      return votable && !voted;
+    });
+  }
+
   ////////////////////////////////////////////
   //// invites
 

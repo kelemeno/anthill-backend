@@ -797,6 +797,15 @@ export class AnthillEngine {
     return this.sentTree(voter) !== address0;
   }
 
+  // Not in the contract: everyone currently in the tree.
+  members(): string[] {
+    const ids: string[] = [];
+    for (const [id, parent] of this.s.sentTreeVote) {
+      if (parent !== address0 && id !== tempAddress && id !== address1) ids.push(id);
+    }
+    return ids;
+  }
+
   // Not in the contract: the voter's children in tree order.
   children(voter: string): string[] {
     const count = this.recTreeCount(voter);
