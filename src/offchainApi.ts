@@ -4,15 +4,28 @@
 // default community, so pages loaded before communities existed keep working.
 //
 // Private communities answer 404 to anyone who isn't a member, as if they
-// didn't exist; the only way in is an invite.
+// didn't exist; the only way in is an invite. Their ids share one namespace
+// with public ones, though: starting a community at a taken private id says
+// it's taken. That's accepted (it shows only that the address exists, nothing
+// in it, and probing is rate limited); pick an unguessable address if even
+// that matters.
+//
+// The WebSocket says "update:<key>" after a change in a community: the key is
+// the id of a public one, and an opaque key for a private one (in its /graph
+// response as `updateKey`, so only its members can tell). A bare "update"
+// means anything may have changed (on startup).
 
+import type { NonSharedBuffer } from "node:buffer";
+import { createHmac, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { promisify } from "node:util";
+import { createGzip, gunzip } from "node:zlib";
 import type { Context, Hono } from "hono";
 import type { AnthillContractType } from "./anthillContract";
 import { PasskeyAuth } from "./auth";
 import { address0, type GraphData } from "./dagBase";
-import { type History, snapshotNodes } from "./dagHistory";
+import { type History, type HistoryNode, type HistoryStep, snapshotNodes } from "./dagHistory";
 import { loadAnthillGraph } from "./dagLoading";
 import {
   calculateDepthAndRelRoot,
@@ -21,22 +34,27 @@ import {
 } from "./dagProcessing";
 import type { AnthillEngine, EngineEvent, SeedGraph } from "./engine";
 import { playDemoStory } from "./demoStory";
-import { clientIp, jsonBody, NotFoundError, rateLimit, requireAdmin } from "./http";
+import { clientIp, jsonBody, NotFoundError, rateCount, rateLimit, rateRoom, requireAdmin } from "./http";
 import { NodeDataStoreCollapse, type NodeDataString } from "./nodeData";
-import { ActionError, Communities, type Executed, type OffchainTree } from "./offchain";
+import { ActionError, Communities, type Executed, type OffchainTree, parseName } from "./offchain";
 import { Polls, setProfile } from "./social";
 import {
   type ActionEntry,
   bigintReviver,
   DEFAULT_COMMUNITY,
   Store,
+  type StoredUser,
 } from "./store";
 
 type Snapshot = { graph: SeedGraph; history: History; randomLeaf: string };
 
 // The seeded tree (the original Anthill one) is a demo; the commons is for
-// real members, and starts empty. Its founder starts its tree: Kalman's
-// account, the only real person in the original tree when it moved.
+// real members, and starts empty. Its founder starts its tree: by default
+// Kalman's account, the only real person in the original tree when it moved
+// (production's log already has the move, so this only matters for a new data
+// dir). COMMONS_FOUNDER names another account; a founder without an account
+// here (a fresh dev or staging data dir) would lock the commons for good, so
+// then it has none and anyone can start it.
 const DEMO = {
   id: "demo",
   name: "Anthill Demo",
@@ -47,49 +65,118 @@ const DEMO = {
   createdBy: "",
 } as const;
 const COMMONS_FOUNDER = process.env.COMMONS_FOUNDER || "0xa0d64a92e36a7c122b28bd2e4b60b96aa8bd6c3d";
+const gunzipAsync = promisify(gunzip);
+// actions per /check request
+const MAX_CHECKS = 5;
+// new accounts per client IP and hour
+const SIGNUPS_PER_HOUR = 100;
+// tree actions per account and day
+const ACTIONS_PER_DAY = 500;
 // marks that the demo's story (demoStory.ts) has been played
 const DEMO_STORY = "demo-story-1";
 
+const BENEDEK = "0xc689334412b0666069b309dfd658f56b95dbaf5d";
+
+// Joins `who` to a tree at its first free spot from the top, with an admin
+// invite (whatever its join policy). False if nobody has started it yet.
+function joinAtTop(tree: OffchainTree, who: string, name: string): boolean {
+  const root = tree.engine.root();
+  if (!tree.engine.isInTree(root)) return false;
+  const queue = [root];
+  while (tree.engine.children(queue[0]).length >= 2) {
+    queue.push(...tree.engine.children(queue.shift()!));
+  }
+  const at = queue[0];
+  // a dry run first, so a failure leaves nothing behind (not even the invite)
+  tree.engine.simulate((e) => e.joinTree(who, name, at));
+  const invite = tree.createAdminInvite(at).code;
+  tree.execute(who, { fn: "joinTree", args: { name, invite } });
+  return true;
+}
+
 // One-time fixes to the live data, run in order on startup after the demo's
-// story (each is marked in the log and never runs twice). They get the loaded
-// trees (a scratch copy; their actions go to the log and the load replays them).
-const FIXES: { id: string; run: (communities: Communities, store: Store) => void }[] = [
+// story. They get the loaded trees (a scratch copy; their actions go to the
+// log and the load replays them). A fix returns whether it's done: it's then
+// marked in the log and never runs again. Until then (not possible yet, or it
+// threw) it runs again on the next start, so it must pick up where it stopped
+// and check what it needs before it changes anything.
+const FIXES: { id: string; run: (communities: Communities, store: Store) => boolean }[] = [
   {
     // The demo is for looking around: nobody joins it (not even by invite).
     id: "close-demo",
     run: (_communities, store) => {
       const demo = store.community(DEMO.id);
-      if (demo === undefined) return;
+      if (demo === undefined) return true;
       const { name, description, visibility } = demo;
       store.updateCommunity(DEMO.id, { name, description, visibility, joinPolicy: "closed" });
+      return true;
     },
   },
   {
     // Benedek joined the demo by mistake (through an invite from it): move him
-    // to the commons, under its root.
+    // to the commons, at its first free spot from the top. He joins the commons
+    // first (with an admin invite, whatever its join policy), then leaves the
+    // demo, so he's never in neither.
     id: "benedek-to-commons",
     run: (communities, store) => {
-      const who = "0xc689334412b0666069b309dfd658f56b95dbaf5d";
       const demo = communities.get(DEMO.id);
       const commons = communities.get(DEFAULT_COMMUNITY);
-      if (demo === undefined || commons === undefined) return;
-      if (demo.engine.isInTree(who)) demo.execute(who, { fn: "leaveTree" });
-      const root = commons.engine.root();
-      if (commons.engine.isInTree(who) || !commons.engine.isInTree(root)) return;
-      // the first free spot from the top
-      const queue = [root];
-      while (queue.length > 0) {
-        const at = queue.shift()!;
-        if (commons.engine.children(at).length < 2) {
-          const name = store.user(who)?.name || "Benedek";
-          commons.execute(who, { fn: "joinTree", args: { name, recipient: at } });
-          return;
-        }
-        queue.push(...commons.engine.children(at));
+      if (demo === undefined || commons === undefined || !demo.engine.isInTree(BENEDEK)) return true;
+      const name = store.user(BENEDEK)?.name || "Benedek";
+      if (!commons.engine.isInTree(BENEDEK) && !joinAtTop(commons, BENEDEK, name)) return false;
+      demo.execute(BENEDEK, { fn: "leaveTree" });
+      return true;
+    },
+  },
+  {
+    // The first version of the fix above left the demo first and was marked
+    // done even when the commons hadn't been started yet, leaving him in
+    // neither. Then he joins the commons now (once it's started), unless he
+    // was ever in it (and left on his own).
+    id: "benedek-to-commons-2",
+    run: (communities, store) => {
+      const demo = communities.get(DEMO.id);
+      const commons = communities.get(DEFAULT_COMMUNITY);
+      if (
+        demo === undefined ||
+        commons === undefined ||
+        demo.engine.isInTree(BENEDEK) ||
+        commons.engine.isInTree(BENEDEK) ||
+        store.joinedAt(DEFAULT_COMMUNITY, BENEDEK) !== undefined ||
+        store.joinedAt(DEMO.id, BENEDEK) === undefined
+      ) {
+        return true;
       }
+      return joinAtTop(commons, BENEDEK, store.user(BENEDEK)?.name || "Benedek");
+    },
+  },
+  {
+    // Closed communities (the demo) were logged as joinPolicy "closed", which
+    // code from before it treats as open: log them again in the form a
+    // rollback reads as invite only (see store.ts toStored). Same settings.
+    id: "closed-rollback-safe",
+    run: (_communities, store) => {
+      for (const { id, name, description, visibility, joinPolicy } of store.communities()) {
+        if (joinPolicy === "closed") store.updateCommunity(id, { name, description, visibility, joinPolicy });
+      }
+      return true;
     },
   },
 ];
+
+// Whether a node looks the same in two history steps.
+function sameNode(a: HistoryNode, b: HistoryNode) {
+  const sameIds = (x: string[], y: string[]) => x.length === y.length && x.every((id, i) => id === y[i]);
+  return (
+    a.id === b.id &&
+    a.name === b.name &&
+    a.currentRep === b.currentRep &&
+    a.depth === b.depth &&
+    a.sentTreeVote === b.sentTreeVote &&
+    sameIds(a.recTreeVotes, b.recTreeVotes) &&
+    sameIds(a.dagVotes, b.dagVotes)
+  );
+}
 
 // What's served for one community, rebuilt after every action.
 class TreeView {
@@ -97,6 +184,8 @@ class TreeView {
   version = 0;
   randomLeaf = address0;
   history: History = { steps: [] };
+  // the served history, serialized and gzipped once per step
+  private historyGzip: { steps: number; body: Promise<NonSharedBuffer> } | undefined;
 
   // Recompute from the engine. The engine answers the same reads as the
   // contract, so this reuses the chain loader.
@@ -113,9 +202,16 @@ class TreeView {
     this.version += 1;
   }
 
+  // Each step has every node, as the replay needs; a node that didn't change
+  // is the previous step's object, so a step mostly costs its list.
   pushStep(entry: ActionEntry, events: EngineEvent[]) {
     const args = entry.action.args as Record<string, string | undefined>;
     const index = this.history.steps.length;
+    const previous = new Map(this.history.steps[index - 1]?.nodes.map((n) => [n.id, n]));
+    const nodes = snapshotNodes(this.graph).map((node) => {
+      const before = previous.get(node.id);
+      return before !== undefined && sameNode(before, node) ? before : node;
+    });
     this.history.steps.push({
       index,
       eventName: events[events.length - 1]?.eventName ?? entry.action.fn,
@@ -124,9 +220,54 @@ class TreeView {
       name: args.name ?? "",
       weight: args.weight ?? "0",
       blockNumber: index,
-      nodes: snapshotNodes(this.graph),
+      nodes,
     });
   }
+
+  // Made at most once per step and one at a time per community (each waits
+  // for the one before), since a long history takes a while.
+  historyBody(): Promise<NonSharedBuffer> {
+    const steps = this.history.steps.length;
+    if (this.historyGzip?.steps !== steps) {
+      const before = this.historyGzip?.body.catch(() => undefined);
+      const list = this.history.steps.slice();
+      const body = Promise.resolve(before).then(() => gzipHistory(list));
+      this.historyGzip = { steps, body };
+      // a failed one is made again on the next request
+      body.catch(() => {
+        if (this.historyGzip?.body === body) this.historyGzip = undefined;
+      });
+    }
+    return this.historyGzip.body;
+  }
+}
+
+// steps serialized between pauses
+const HISTORY_BATCH = 50;
+
+// The history as JSON ({ steps }), gzipped a batch of steps at a time: a long
+// one never blocks the server for long, nor is it ever one string (V8 caps a
+// string at about 512 MB).
+async function gzipHistory(steps: HistoryStep[]): Promise<NonSharedBuffer> {
+  const gzip = createGzip();
+  const chunks: Buffer[] = [];
+  gzip.on("data", (chunk: Buffer) => chunks.push(chunk));
+  const ended = new Promise<void>((resolve, reject) => {
+    gzip.on("end", resolve);
+    gzip.on("error", reject);
+  });
+  const write = (text: string) =>
+    new Promise<void>((resolve) => (gzip.write(text) ? resolve() : gzip.once("drain", resolve)));
+  await write('{"steps":[');
+  for (let i = 0; i < steps.length; i += HISTORY_BATCH) {
+    const batch = steps.slice(i, i + HISTORY_BATCH).map((step) => JSON.stringify(step));
+    await write((i === 0 ? "" : ",") + batch.join(","));
+    // let requests in between
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  gzip.end("]}");
+  await ended;
+  return Buffer.concat(chunks);
 }
 
 // Paths that also answer, unscoped, for the default community.
@@ -158,8 +299,25 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   }
   if (store.seed !== undefined && store.originalCommunity === DEFAULT_COMMUNITY) {
     console.log("Moving the seeded tree to the demo community; the commons starts empty");
-    store.moveCommons({ ...DEMO, createdAt: new Date().toISOString() }, COMMONS_FOUNDER);
+    const founder = store.user(COMMONS_FOUNDER) !== undefined ? COMMONS_FOUNDER : "";
+    if (founder === "") {
+      console.log(`No account ${COMMONS_FOUNDER} (COMMONS_FOUNDER): anyone can start the commons`);
+    }
+    store.moveCommons({ ...DEMO, createdAt: new Date().toISOString() }, founder);
   }
+
+  // Until start() has rebuilt everything from the log, the trees hold only part
+  // of it: an action taken then would be checked against the wrong state, and
+  // pages would see (and cache) a half-built tree. So everything but signing in
+  // (and the WebSocket) waits.
+  let ready = false;
+  app.use("*", async (c, next) => {
+    if (!ready && c.req.path !== "/" && !c.req.path.startsWith("/auth/")) {
+      c.header("Retry-After", "5");
+      return c.json({ error: "Starting up, try again in a moment." }, 503);
+    }
+    await next();
+  });
 
   const auth = new PasskeyAuth(store);
   const communities = new Communities(store);
@@ -181,8 +339,9 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
       p = new Polls(
         store,
         tree.id,
-        (id) => tree.engine.isInTree(id),
+        (id) => tree.isMember(id),
         (id) => viewOf(tree).graph.dict[id]?.currentRep ?? 0n,
+        () => tree.info.createdBy || tree.engine.root(),
       );
       polls.set(tree.id, p);
     }
@@ -201,9 +360,32 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
     view.pushStep(entry, events);
   }
 
-  // Tell open pages to reload. Private communities' ids aren't broadcast.
-  function notify(tree: OffchainTree) {
-    broadcast(tree.info.visibility === "public" ? `update:${tree.id}` : "update");
+  // What the WebSocket calls a community (see the top): private ones' ids
+  // aren't broadcast. The key can't be an id ("_" isn't allowed in one).
+  const keySecret = process.env.SESSION_SECRET || store.sessionSecret(() => randomBytes(32).toString("hex"));
+  function updateKeyOf(tree: OffchainTree) {
+    if (tree.info.visibility === "public") return tree.id;
+    return `p_${createHmac("sha256", keySecret).update(`update-key:${tree.id}`).digest("hex").slice(0, 24)}`;
+  }
+
+  // Tell open pages of these communities to reload (also under `before`, the
+  // key from before a change of visibility).
+  function notify(trees: OffchainTree[], before?: string) {
+    const keys = new Set(trees.map(updateKeyOf));
+    if (before !== undefined) keys.add(before);
+    for (const key of keys) broadcast(`update:${key}`);
+  }
+
+  // Rename the account everywhere (POST /name, or changeName as an action),
+  // and tell the communities whose node changed.
+  async function rename(user: StoredUser, body: unknown) {
+    rateLimit(`name:${user.id}`, 10);
+    let renamed: Executed[] = [];
+    await serially(async () => {
+      renamed = communities.rename(user, body);
+      for (const executed of renamed) await record(executed);
+    });
+    notify(renamed.map((executed) => executed.tree));
   }
 
   // Actions are handled one at a time so each history step shows the graph
@@ -216,6 +398,22 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   }
 
   const signedIn = (c: Context) => auth.userFromHeader(c.req.header("Authorization"));
+  const freshUser = (c: Context) => auth.freshUserFromHeader(c.req.header("Authorization"));
+
+  // The body of a passkey ceremony's second step, checked before the flow is
+  // used up, so a malformed one is a 400 and the flow can still be finished.
+  async function ceremony(c: Context) {
+    const { flowId, response } = await jsonBody(c);
+    if (
+      typeof flowId !== "string" ||
+      typeof response !== "object" ||
+      response === null ||
+      typeof response.id !== "string"
+    ) {
+      throw new ActionError("expected a flowId and a passkey response");
+    }
+    return { flowId, response };
+  }
 
   const viewerOf = (c: Context) => {
     try {
@@ -237,8 +435,9 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   function summary(tree: OffchainTree, viewer?: string) {
     const { id, name, description, visibility, joinPolicy, createdBy, createdAt } = tree.info;
     const { dict, rootId } = viewOf(tree).graph;
-    const members = tree.engine.members();
-    const me = viewer !== undefined && tree.engine.isInTree(viewer) ? dict[viewer] : undefined;
+    // as served: not whoever the root doesn't reach (see isMember)
+    const members = tree.engine.members().filter((m) => tree.isMember(m));
+    const me = viewer !== undefined && tree.isMember(viewer) ? dict[viewer] : undefined;
     return {
       id,
       name,
@@ -278,15 +477,21 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
 
   app.post("/auth/register/options", async (c) => {
     const { name } = await jsonBody(c);
-    if (typeof name !== "string" || name.trim() === "" || name.trim().length > 40) {
-      throw new ActionError("Names must be 1-40 characters.");
-    }
-    return c.json(await auth.registrationOptions(name.trim()));
+    return c.json(await auth.registrationOptions(parseName(name)));
   });
 
+  // New accounts per IP and hour (only ones made: a failed try doesn't count),
+  // with room for a meetup on one Wi-Fi. Passkeys cost nothing to make in
+  // software, so this only slows scripted sign-ups down (the IP isn't
+  // trustworthy either); invite-only communities are the real guard against
+  // fake members.
   app.post("/auth/register/verify", async (c) => {
-    const { flowId, response } = await jsonBody(c);
-    return c.json(await auth.verifyRegistration(flowId, response));
+    const { flowId, response } = await ceremony(c);
+    const key = `signup:${clientIp(c)}`;
+    rateRoom(key, SIGNUPS_PER_HOUR);
+    const created = await auth.verifyRegistration(flowId, response);
+    rateCount(key, 60 * 60_000);
+    return c.json(created);
   });
 
   app.post("/auth/login/options", async (c) => {
@@ -294,7 +499,7 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   });
 
   app.post("/auth/login/verify", async (c) => {
-    const { flowId, response } = await jsonBody(c);
+    const { flowId, response } = await ceremony(c);
     return c.json(await auth.verifyAuthentication(flowId, response));
   });
 
@@ -303,14 +508,16 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
     return c.json({ user, profile: store.profile(user.id) ?? { bio: "", link: "" } });
   });
 
-  // Another passkey (device) for the signed-in account.
+  // Another passkey (device) for the signed-in account. Needs a recent
+  // sign-in; the flow then ends with the session (e.g. after sign-out
+  // everywhere).
   app.post("/auth/passkeys/options", async (c) => {
-    return c.json(await auth.addPasskeyOptions(signedIn(c)));
+    return c.json(await auth.addPasskeyOptions(freshUser(c)));
   });
 
   app.post("/auth/passkeys/verify", async (c) => {
     const user = signedIn(c);
-    const { flowId, response } = await jsonBody(c);
+    const { flowId, response } = await ceremony(c);
     return c.json(await auth.verifyAddPasskey(user, flowId, response));
   });
 
@@ -323,30 +530,35 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   });
 
   app.post("/auth/recover/verify", async (c) => {
-    const { flowId, response } = await jsonBody(c);
+    const { flowId, response } = await ceremony(c);
     return c.json(await auth.verifyRecovery(flowId, response));
   });
 
+  // Needs a recent sign-in: whoever holds only a copied token can't take the
+  // account's recovery over.
   app.post("/auth/recovery-code", (c) => {
-    return c.json({ recoveryCode: auth.newRecoveryCode(signedIn(c)) });
+    return c.json({ recoveryCode: auth.newRecoveryCode(freshUser(c)) });
+  });
+
+  // Ends every session of the account, this one too (a lost device, a shared
+  // computer). The passkeys stay.
+  app.post("/auth/sign-out-everywhere", (c) => {
+    return c.json(auth.signOutEverywhere(signedIn(c)));
   });
 
   // Rename the account, and its node in every community it's in.
   app.post("/name", async (c) => {
     const user = signedIn(c);
-    const body = await jsonBody(c);
-    await serially(async () => {
-      const renamed = communities.rename(user, body);
-      for (const executed of renamed) await record(executed);
-    });
-    broadcast("update");
+    await rename(user, await jsonBody(c));
     return c.json({ user: store.user(user.id) });
   });
 
   // Bio and link, shown in every community.
   app.post("/profile", async (c) => {
-    const profile = setProfile(store, signedIn(c).id, await jsonBody(c));
-    broadcast("update");
+    const user = signedIn(c);
+    rateLimit(`profile:${user.id}`, 10);
+    const { profile, changed } = setProfile(store, user.id, await jsonBody(c));
+    if (changed) notify(communities.all().filter((tree) => tree.isMember(user.id)));
     return c.json({ profile });
   });
 
@@ -375,7 +587,7 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
       created = communities.create(user, body);
       await record(created);
     });
-    notify(created!.tree);
+    notify([created!.tree]);
     return c.json({ community: summary(created!.tree, user.id) });
   });
 
@@ -388,15 +600,16 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   app.post("/c/:cid/settings", async (c) => {
     const user = signedIn(c);
     const tree = visibleTree(c, user.id);
-    communities.updateSettings(user.id, tree, await jsonBody(c));
-    broadcast("update");
+    const before = updateKeyOf(tree);
+    if (communities.updateSettings(user.id, tree, await jsonBody(c))) notify([tree], before);
     return c.json({ community: summary(tree, user.id) });
   });
 
   ////////////////////////////////////////////
   //// inside a community
 
-  // The whole served tree in one response. `version` changes on every update.
+  // The whole served tree in one response. `version` changes on every update;
+  // `updateKey` is what the WebSocket calls this community (see the top).
   route("GET", "/graph", (c) => {
     const viewer = viewerOf(c);
     const tree = visibleTree(c, viewer);
@@ -407,6 +620,7 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
     }
     return c.json({
       version: view.version,
+      updateKey: updateKeyOf(tree),
       rootId: view.graph.rootId,
       maxRelRootDepth: view.graph.maxRelRootDepth,
       randomLeaf: view.randomLeaf,
@@ -416,14 +630,26 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
     });
   });
 
-  // Every past step of the tree, each with a snapshot of all nodes.
-  route("GET", "/history", (c) => {
-    return c.json(viewOf(visibleTree(c, viewerOf(c))).history);
+  // Every past step of the tree, each with a snapshot of all nodes. It's big
+  // (it grows with steps times members), so it's sent gzipped, made once per
+  // step, and limited per client.
+  route("GET", "/history", async (c) => {
+    rateLimit(`history:${clientIp(c)}`, 30);
+    const body = await viewOf(visibleTree(c, viewerOf(c))).historyBody();
+    c.header("Content-Type", "application/json");
+    c.header("Vary", "Accept-Encoding");
+    if (!/\bgzip\b/.test(c.req.header("Accept-Encoding") ?? "")) return c.body(await gunzipAsync(body));
+    c.header("Content-Encoding", "gzip");
+    return c.body(body);
   });
 
   // Run one tree action as the signed-in user.
   route("POST", "/action", async (c) => {
     const user = signedIn(c);
+    rateLimit(`action:${user.id}`, 60);
+    // each action is a history step with the whole tree: a day's cap keeps
+    // one account toggling an endorsement from growing it without end
+    rateLimit(`actions-day:${user.id}`, ACTIONS_PER_DAY, 24 * 60 * 60_000);
     const body = await jsonBody(c);
     const tree = communities.get(cidOf(c));
     // Outsiders of a private community can only join it, with its invite.
@@ -435,20 +661,29 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
     if (tree === undefined || !(tree.visibleTo(user.id) || invited)) {
       throw new NotFoundError();
     }
+    // One name per account: renaming here renames it everywhere, as /name.
+    if (body.fn === "changeName") {
+      if (!tree.isMember(user.id)) throw new ActionError("Join the tree first.", "not in tree");
+      await rename(user, body.args);
+      return c.json({ ok: true });
+    }
     await serially(async () => {
       await record(tree.execute(user.id, body));
     });
-    notify(tree);
+    notify([tree]);
     return c.json({ ok: true });
   });
 
-  // Dry-run up to 20 actions: for each, whether it would work and if not why.
+  // Dry-run a few actions (a person's page asks about at most three): for
+  // each, whether it would work and if not why. Each dry run blocks the server
+  // for a copy of the whole tree, hence the small batch and the per-user limit.
   route("POST", "/check", async (c) => {
     const user = signedIn(c);
+    rateLimit(`check:${user.id}`, 120);
     const tree = visibleTree(c, user.id);
     const { actions } = await jsonBody(c);
-    if (!Array.isArray(actions) || actions.length > 20) {
-      throw new ActionError("expected up to 20 actions");
+    if (!Array.isArray(actions) || actions.length > MAX_CHECKS) {
+      throw new ActionError(`expected up to ${MAX_CHECKS} actions`);
     }
     return c.json({ results: tree.check(user.id, actions) });
   });
@@ -472,12 +707,14 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
 
   route("POST", "/polls", async (c) => {
     const user = signedIn(c);
+    rateLimit(`polls:${user.id}`, 30);
     const tree = visibleTree(c, user.id);
     return c.json({ poll: pollsOf(tree).createPoll(user.id, await jsonBody(c)) });
   });
 
   route("POST", "/polls/:id/vote", async (c) => {
     const user = signedIn(c);
+    rateLimit(`polls:${user.id}`, 30);
     const tree = visibleTree(c, user.id);
     return c.json({
       poll: pollsOf(tree).votePoll(user.id, param(c, "id"), await jsonBody(c)),
@@ -486,6 +723,7 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
 
   route("POST", "/polls/:id/close", (c) => {
     const user = signedIn(c);
+    rateLimit(`polls:${user.id}`, 30);
     const tree = visibleTree(c, user.id);
     return c.json({ poll: pollsOf(tree).closePoll(user.id, param(c, "id")) });
   });
@@ -551,17 +789,29 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
         const scratch = new Communities(store);
         await scratch.load(async () => {});
         for (const fix of pending) {
-          store.markMigration(fix.id);
           try {
-            fix.run(scratch, store);
-            console.log("Applied fix", fix.id);
+            if (fix.run(scratch, store)) {
+              store.markMigration(fix.id);
+              console.log("Applied fix", fix.id);
+            } else {
+              console.log("Fix", fix.id, "isn't possible yet, trying again on the next start");
+            }
           } catch (e) {
-            console.error("Fix failed", fix.id, e);
+            console.error("Fix failed", fix.id, "(trying again on the next start)", e);
           }
         }
       }
-      await communities.load(record);
-      for (const tree of communities.all()) await viewOf(tree).rebuild(tree.engine);
+      await serially(() => communities.load(record));
+      for (const tree of communities.all()) {
+        await viewOf(tree).rebuild(tree.engine);
+        // in the engine's tree but out of the root's reach (placed under its
+        // scratch node before the API refused that): not shown, not members
+        const detached = tree.detached();
+        if (detached.length > 0) {
+          console.warn(`Community ${tree.id}: ${detached.length} detached from the root:`, detached);
+        }
+      }
+      ready = true;
       broadcast("update");
       console.log(
         "Loaded",

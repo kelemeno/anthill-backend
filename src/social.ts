@@ -4,6 +4,9 @@
 // Polls belong to a community: only its members create and vote in them, and a
 // poll's weight per option is the sum of its voters' current reputation there,
 // so open polls move as reputation changes; closing a poll freezes the tally.
+// Only current members' votes count: someone who left (and came back) votes
+// again. Its creator closes a poll, or once the creator has left the founder
+// (the tree's root in a community without one, e.g. a fresh commons).
 // Profiles belong to the account and show in every community.
 
 import { randomBytes } from "node:crypto";
@@ -14,6 +17,11 @@ const MAX_QUESTION = 200;
 const MAX_OPTION = 80;
 const MAX_BIO = 280;
 const MAX_LINK = 200;
+// Polls are kept forever and listed whole: a cap on each member's open ones,
+// on the community's open ones, and on all it ever had.
+const MAX_OPEN_POLLS_PER_MEMBER = 5;
+const MAX_OPEN_POLLS = 30;
+const MAX_POLLS = 500;
 
 export type PollView = {
   id: string;
@@ -26,6 +34,8 @@ export type PollView = {
   // per option: total reputation (as a decimal string, 18 decimals) and voters
   tally: { weight: string; voters: number }[];
   myVote?: number;
+  // whether the viewer may close it
+  canClose: boolean;
 };
 
 // One community's polls.
@@ -35,6 +45,9 @@ export class Polls {
     private community: string,
     private isMember: (id: string) => boolean,
     private reputationOf: (id: string) => bigint,
+    // who closes polls whose creator left: the community's founder, or its
+    // root without one ("" or address0 when there's nobody)
+    private steward: () => string,
   ) {}
 
   listPolls(viewer?: string): PollView[] {
@@ -68,6 +81,19 @@ export class Polls {
         `A poll needs 2-6 different options of 1-${MAX_OPTION} characters each.`,
       );
     }
+    const all = this.store.polls(this.community);
+    const open = all.filter((p) => p.closed === undefined);
+    if (open.filter((p) => p.by === by).length >= MAX_OPEN_POLLS_PER_MEMBER) {
+      throw new ActionError(
+        `You already have ${MAX_OPEN_POLLS_PER_MEMBER} open polls here. Close one before you ask again.`,
+      );
+    }
+    if (open.length >= MAX_OPEN_POLLS) {
+      throw new ActionError(`This community already has ${MAX_OPEN_POLLS} open polls. Wait until some close.`);
+    }
+    if (all.length >= MAX_POLLS) {
+      throw new ActionError(`This community has reached its ${MAX_POLLS} polls.`);
+    }
     const id = randomBytes(8).toString("hex");
     this.store.addPoll(this.community, id, by, question.trim(), cleaned);
     return this.view(this.store.poll(id)!, by);
@@ -85,20 +111,42 @@ export class Polls {
     ) {
       throw new ActionError("Pick one of the poll's options.");
     }
-    this.store.votePoll(poll.id, by, option);
+    // the same vote again changes nothing (and isn't logged)
+    if (this.voteOf(poll, by) !== option) this.store.votePoll(poll.id, by, option);
     return this.view(poll, by);
   }
 
   closePoll(by: string, pollId: string): PollView {
     const poll = this.openPoll(pollId);
-    if (poll.by !== by) {
-      throw new ActionError("Only the person who created a poll can close it.");
+    if (!this.mayClose(poll, by)) {
+      throw new ActionError(
+        "Only the person who created a poll can close it (or, once they've left, the community's founder).",
+      );
     }
+    const tally = this.liveTally(poll);
     this.store.closePoll(
       poll.id,
-      this.liveTally(poll).map((t) => t.weight.toString()),
+      tally.map((t) => t.weight.toString()),
+      tally.map((t) => t.voters),
     );
     return this.view(poll, by);
+  }
+
+  private mayClose(poll: Poll, by: string) {
+    if (by === poll.by) return true;
+    const steward = this.steward();
+    return steward !== "" && by === steward && !this.isMember(poll.by);
+  }
+
+  // The option `voter` picked, if their vote counts: they're a member, and
+  // voted since they last joined (a vote from before they left doesn't come
+  // back with them).
+  private voteOf(poll: Poll, voter: string): number | undefined {
+    const option = poll.votes.get(voter);
+    if (option === undefined || !this.isMember(voter)) return undefined;
+    const joined = this.store.joinedAt(this.community, voter);
+    if (joined !== undefined && (poll.votedAt.get(voter) ?? "") < joined) return undefined;
+    return option;
   }
 
   private openPoll(pollId: string): Poll {
@@ -112,7 +160,9 @@ export class Polls {
 
   private liveTally(poll: Poll) {
     const tally = poll.options.map(() => ({ weight: 0n, voters: 0 }));
-    for (const [voter, option] of poll.votes) {
+    for (const voter of poll.votes.keys()) {
+      const option = this.voteOf(poll, voter);
+      if (option === undefined) continue;
       tally[option].weight += this.reputationOf(voter);
       tally[option].voters += 1;
     }
@@ -120,11 +170,13 @@ export class Polls {
   }
 
   private view(poll: Poll, viewer?: string): PollView {
-    const live = this.liveTally(poll);
-    const tally = live.map((t, i) => ({
-      weight: poll.closed !== undefined ? poll.closed.tally[i] : t.weight.toString(),
-      voters: t.voters,
-    }));
+    const { closed } = poll;
+    // closed before the voter counts were logged: every vote it had
+    const allVoters = (i: number) => [...poll.votes.values()].filter((o) => o === i).length;
+    const tally =
+      closed !== undefined
+        ? closed.tally.map((weight, i) => ({ weight, voters: closed.voters?.[i] ?? allVoters(i) }))
+        : this.liveTally(poll).map((t) => ({ weight: t.weight.toString(), voters: t.voters }));
     return {
       id: poll.id,
       by: poll.by,
@@ -134,7 +186,9 @@ export class Polls {
       createdAt: poll.at,
       closedAt: poll.closed?.at,
       tally,
-      myVote: viewer === undefined ? undefined : poll.votes.get(viewer),
+      myVote:
+        viewer === undefined ? undefined : closed !== undefined ? poll.votes.get(viewer) : this.voteOf(poll, viewer),
+      canClose: viewer !== undefined && closed === undefined && this.mayClose(poll, viewer),
     };
   }
 
@@ -145,7 +199,13 @@ export class Polls {
   }
 }
 
-export function setProfile(store: Store, userId: string, body: unknown): Profile {
+// Sets the profile; `changed` is false (and nothing is logged) when it was
+// already this.
+export function setProfile(
+  store: Store,
+  userId: string,
+  body: unknown,
+): { profile: Profile; changed: boolean } {
   const { bio = "", link = "" } = (body ?? {}) as { bio?: unknown; link?: unknown };
   if (typeof bio !== "string" || bio.trim().length > MAX_BIO) {
     throw new ActionError(`The bio can be at most ${MAX_BIO} characters.`);
@@ -166,6 +226,8 @@ export function setProfile(store: Store, userId: string, body: unknown): Profile
     }
   }
   const profile = { bio: bio.trim(), link: trimmedLink };
+  const before = store.profile(userId) ?? { bio: "", link: "" };
+  if (before.bio === profile.bio && before.link === profile.link) return { profile, changed: false };
   store.setProfile(userId, profile);
-  return profile;
+  return { profile, changed: true };
 }

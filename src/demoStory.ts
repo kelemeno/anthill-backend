@@ -11,7 +11,8 @@
 // Every action is run as that member through the same checks as a real one
 // (an action that isn't possible is skipped) and logged like any other; the
 // server plays it once on startup, before loading, so the load replays it
-// like everything else. Real people never act in it.
+// like everything else. Real people never act in it, and nobody acts where a
+// real person would be moved or lose an endorsement as a side effect.
 
 import type { AnthillEngine } from "./engine";
 import { ActionError, type OffchainTree } from "./offchain";
@@ -65,6 +66,8 @@ export function playDemoStory(
   };
   const byId = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
   const actors = () => e.members().filter((id) => !isReal(id)).sort(byId);
+  // someone and everyone under them are scripted
+  const allScripted = (id: string) => !isReal(id) && !below(e, id).some(isReal);
   // the branch just under the root that someone is in
   const branch = (id: string) => {
     let at = id;
@@ -121,6 +124,8 @@ export function playDemoStory(
     const candidates: { star: string; cost: number }[] = [];
     for (const id of actors()) {
       if (depth(id) < 2 || depth(id) > 4 || used.has(id) || used.has(e.parent(id))) continue;
+      // the climb moves the parent and both their branches
+      if (!allScripted(e.parent(id))) continue;
       if (stars.some((s) => branch(s) === branch(id))) continue;
       const cost = rehearse(id);
       if (cost !== undefined) candidates.push({ star: id, cost });
@@ -161,7 +166,7 @@ export function playDemoStory(
   // 3. Leaving: someone in the middle of the tree leaves, and the people under
   // them move up (which frees a spot higher up).
   const leaver = actors()
-    .filter((id) => !used.has(id) && e.children(id).length === 2 && depth(id) >= 2)
+    .filter((id) => !used.has(id) && e.children(id).length === 2 && depth(id) >= 2 && allScripted(id))
     .sort((a, b) => depth(a) - depth(b) || byId(a, b))[0];
   if (leaver !== undefined) act(leaver, { fn: "leaveTree" });
 

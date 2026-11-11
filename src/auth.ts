@@ -1,10 +1,16 @@
 // Passkey (WebAuthn) sign-in. A passkey stands in for a wallet: registering one
 // creates a user with a fresh 20-byte hex id, which is used in the tree exactly
-// like an address was. Sessions are stateless HMAC-signed bearer tokens.
+// like an address was. Sessions are HMAC-signed bearer tokens carrying the
+// user's session version: "sign out everywhere" and recovery bump it, which
+// ends every earlier session (tokens from before versions existed count as 0).
 //
 // Signed-in users can add more passkeys (other devices). Each account also has a
 // recovery code, shown once, which can register a new passkey if all devices
-// are lost; using it issues a fresh code.
+// are lost. Using it is single-use: it replaces the code, removes the account's
+// other passkeys (the lost devices) and ends their sessions.
+//
+// Adding a passkey and replacing the recovery code need a recent sign-in, so a
+// copied token alone can't turn into a lasting takeover.
 //
 // Config (env):
 //   RP_ID          the site's domain the passkeys are bound to (default localhost)
@@ -40,8 +46,21 @@ const origins = (process.env.ORIGINS || "http://localhost:5173")
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
+// how recent a sign-in must be for account changes
+const FRESH_SIGN_IN_MS = 10 * 60 * 1000;
 
-export class AuthError extends Error {}
+// `code` lets the frontend tell "sign in again first" from other refusals.
+export class AuthError extends Error {
+  constructor(
+    message: string,
+    readonly code?: "reauth",
+  ) {
+    super(message);
+  }
+}
+
+// The checked contents of a session token.
+type Session = { user: StoredUser; issuedAt: number };
 
 type PendingChallenge = {
   challenge: string;
@@ -49,6 +68,8 @@ type PendingChallenge = {
   kind: "register" | "login" | "add" | "recover";
   // the account a new passkey is for (all kinds but login)
   user?: StoredUser;
+  // recover: the hash of the code that opened it, which must still be current
+  codeHash?: string;
 };
 
 export class PasskeyAuth {
@@ -75,7 +96,8 @@ export class PasskeyAuth {
     return { ...this.session(user), recoveryCode: this.newRecoveryCode(user) };
   }
 
-  // Another passkey for the signed-in user (e.g. a second device).
+  // Another passkey for the signed-in user (e.g. a second device). Needs a
+  // recent sign-in (see freshUserFromHeader).
   async addPasskeyOptions(user: StoredUser) {
     return this.newPasskeyOptions(user, "add");
   }
@@ -89,24 +111,47 @@ export class PasskeyAuth {
     return { ok: true };
   }
 
-  // Lost every passkey: the recovery code lets you register a new one.
+  // Lost every passkey: the recovery code lets you register a new one. The
+  // flow remembers which code opened it, and only the newest flow per account
+  // stays open.
   async recoveryOptions(code: string) {
-    const user = this.store.userByRecoveryHash(hashRecoveryCode(code));
+    const codeHash = hashRecoveryCode(code);
+    const user = this.store.userByRecoveryHash(codeHash);
     if (user === undefined) {
       throw new AuthError("That recovery code isn't valid.");
     }
-    return this.newPasskeyOptions(user, "recover");
+    for (const [id, p] of this.pending) {
+      if (p.kind === "recover" && p.user?.id === user.id) this.pending.delete(id);
+    }
+    const flow = await this.newPasskeyOptions(user, "recover");
+    this.pending.get(flow.flowId)!.codeHash = codeHash;
+    return flow;
   }
 
+  // The new passkey replaces all the others (the lost or stolen devices),
+  // every earlier session ends and the used code is replaced, in one log entry.
   async verifyRecovery(flowId: string, response: RegistrationResponseJSON) {
     const pending = this.take(flowId, "recover");
     const user = pending.user!;
-    this.store.addPasskeyToUser(await this.verifyNewPasskey(pending, response));
-    // the used code is replaced
-    return { ...this.session(user), recoveryCode: this.newRecoveryCode(user) };
+    const passkey = await this.verifyNewPasskey(pending, response);
+    // Checked after the await, with no await before the write: of flows opened
+    // with the same code only one completes, and none after the code changed.
+    if (this.store.recoveryHashOf(user.id) !== pending.codeHash) {
+      throw new AuthError("That recovery code was already used or replaced.");
+    }
+    const code = newRecoveryCode();
+    this.store.recover(user.id, passkey, hashRecoveryCode(code));
+    return { ...this.session(user), recoveryCode: code };
   }
 
-  // Issues a new recovery code for the user; the previous one stops working.
+  // Ends every session of the user, this one included.
+  signOutEverywhere(user: StoredUser) {
+    this.store.signOutAll(user.id);
+    return { ok: true };
+  }
+
+  // Issues a new recovery code for the user; the previous one stops working,
+  // and so do recover flows it opened.
   newRecoveryCode(user: StoredUser): string {
     const code = newRecoveryCode();
     this.store.setRecoveryHash(user.id, hashRecoveryCode(code));
@@ -123,9 +168,12 @@ export class PasskeyAuth {
       excludeCredentials: this.store
         .passkeysOf(user.id)
         .map((p) => ({ id: p.id, transports: p.transports })),
+      // The verifier requires user verification (PIN or biometrics), so ask
+      // for it: a key without a PIN is then asked to set one, instead of
+      // failing after the ceremony.
       authenticatorSelection: {
         residentKey: "required",
-        userVerification: "preferred",
+        userVerification: "required",
       },
     });
     return { flowId: this.remember(options.challenge, kind, user), options };
@@ -140,8 +188,9 @@ export class PasskeyAuth {
       expectedChallenge: pending.challenge,
       expectedOrigin: origins,
       expectedRPID: rpID,
+      requireUserVerification: true,
     }).catch((e: Error) => {
-      throw new AuthError(e.message);
+      throw new AuthError(ceremonyError(e));
     });
     if (!verification.verified) {
       throw new AuthError("passkey not verified");
@@ -164,7 +213,7 @@ export class PasskeyAuth {
     // for this site (discoverable credentials).
     const options = await generateAuthenticationOptions({
       rpID,
-      userVerification: "preferred",
+      userVerification: "required",
     });
     return { flowId: this.remember(options.challenge, "login"), options };
   }
@@ -181,8 +230,9 @@ export class PasskeyAuth {
       expectedOrigin: origins,
       expectedRPID: rpID,
       credential: credentialOf(passkey),
+      requireUserVerification: true,
     }).catch((e: Error) => {
-      throw new AuthError(e.message);
+      throw new AuthError(ceremonyError(e));
     });
     if (!verification.verified) {
       throw new AuthError("passkey not verified");
@@ -193,35 +243,65 @@ export class PasskeyAuth {
 
   // Returns the signed-in user for an `Authorization: Bearer <token>` header.
   userFromHeader(header: string | undefined): StoredUser {
+    return this.sessionFromHeader(header).user;
+  }
+
+  // The same, for account changes: the token must come from a sign-in (or
+  // sign-up, or recovery) in the last few minutes. Signing in again with a
+  // passkey gives one.
+  freshUserFromHeader(header: string | undefined): StoredUser {
+    const { user, issuedAt } = this.sessionFromHeader(header);
+    if (Date.now() - issuedAt > FRESH_SIGN_IN_MS) {
+      throw new AuthError("Please sign in again first, to confirm it's you.", "reauth");
+    }
+    return user;
+  }
+
+  // Revoked tokens get "session expired" too, which the frontend treats as
+  // signed out.
+  private sessionFromHeader(header: string | undefined): Session {
     const token = header?.match(/^Bearer (.+)$/)?.[1];
     if (token === undefined) {
       throw new AuthError("not signed in");
     }
-    const [payload, signature] = token.split(".");
-    if (payload === undefined || signature === undefined) {
+    const parts = token.split(".");
+    if (parts.length !== 2) {
       throw new AuthError("bad session token");
     }
-    const expected = this.sign(payload);
-    if (
-      expected.length !== signature.length ||
-      !timingSafeEqual(Buffer.from(expected), Buffer.from(signature))
-    ) {
+    const [payload, signature] = parts;
+    if (!safeEqual(this.sign(payload), signature)) {
       throw new AuthError("bad session token");
     }
-    const { uid, exp } = JSON.parse(Buffer.from(payload, "base64url").toString());
-    if (typeof exp !== "number" || exp < Date.now()) {
+    let claims: { uid?: unknown; exp?: unknown; iat?: unknown; v?: unknown };
+    try {
+      claims = JSON.parse(Buffer.from(payload, "base64url").toString());
+    } catch {
+      throw new AuthError("bad session token");
+    }
+    // tokens from before iat and v existed: issued long ago, version 0
+    const { uid, exp, iat = 0, v = 0 } = claims ?? {};
+    if (typeof uid !== "string" || typeof iat !== "number" || typeof v !== "number") {
+      throw new AuthError("bad session token");
+    }
+    if (typeof exp !== "number" || exp < Date.now() || v !== this.store.sessionVersion(uid)) {
       throw new AuthError("session expired");
     }
     const user = this.store.user(uid);
     if (user === undefined) {
       throw new AuthError("unknown user");
     }
-    return user;
+    return { user, issuedAt: iat };
   }
 
   private session(user: StoredUser) {
+    const now = Date.now();
     const payload = Buffer.from(
-      JSON.stringify({ uid: user.id, exp: Date.now() + SESSION_TTL_MS }),
+      JSON.stringify({
+        uid: user.id,
+        iat: now,
+        exp: now + SESSION_TTL_MS,
+        v: this.store.sessionVersion(user.id),
+      }),
     ).toString("base64url");
     return { token: `${payload}.${this.sign(payload)}`, user };
   }
@@ -248,6 +328,21 @@ export class PasskeyAuth {
     }
     return pending;
   }
+}
+
+// Constant-time string comparison that never throws: equal-length strings can
+// still differ in byte length (non-ASCII), which timingSafeEqual rejects.
+export function safeEqual(a: string, b: string) {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+
+// The library's message, or a plainer one where users will see it.
+function ceremonyError(e: Error) {
+  return /user verification/i.test(e.message)
+    ? "Your passkey didn't confirm it's you (PIN, fingerprint or face). Set one up on the device and try again."
+    : e.message;
 }
 
 function newUserId() {

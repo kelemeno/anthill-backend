@@ -18,7 +18,8 @@
 
 export const address0 = "0x0000000000000000000000000000000000000000";
 export const address1 = "0x0000000000000000000000000000000000000001";
-const tempAddress = "0x0000000000000000000000000000000099999999";
+// the scratch node handleDagVoteReplace parks in the tree during a move
+export const tempAddress = "0x0000000000000000000000000000000099999999";
 
 const MAX_REL_ROOT_DEPTH = 6;
 const decimalPoint = 18n;
@@ -499,23 +500,30 @@ export class AnthillEngine {
   ////////////////////////////////////////////
   //// Reputation related
 
+  // Unlike the contract, each endorser's reputation is computed once per call
+  // (memo): the contract recomputes it for every path to it, which grows
+  // exponentially with depth. A node's value depends only on the votes it
+  // receives (from strictly lower nodes), so the result is the same.
   calculateReputation(voter: string): bigint {
-    return this.calculateReputationInner(voter, 0);
+    return this.calculateReputationInner(voter, 0, new Map());
   }
 
-  private calculateReputationInner(voter: string, depth: number): bigint {
+  private calculateReputationInner(voter: string, depth: number, memo: Map<string, bigint>): bigint {
     let voterReputation = 0n;
     if (voter === address0) return 0n;
+    const known = memo.get(voter);
+    if (known !== undefined) return known;
 
     for (let count = 0; count < this.recCount(voter); count++) {
       const rDagVote = this.readRec(voter, count);
       voterReputation +=
-        (this.calculateReputationInner(rDagVote.id, depth + 1) * rDagVote.weight) /
+        (this.calculateReputationInner(rDagVote.id, depth + 1, memo) * rDagVote.weight) /
         this.totalWeight(rDagVote.id);
     }
 
     voterReputation += 10n ** decimalPoint;
     this.s.reputation.set(voter, voterReputation);
+    memo.set(voter, voterReputation);
     return voterReputation;
   }
 
@@ -804,6 +812,11 @@ export class AnthillEngine {
       if (parent !== address0 && id !== tempAddress && id !== address1) ids.push(id);
     }
     return ids;
+  }
+
+  // Not in the contract: the voter's name in this tree.
+  name(voter: string): string {
+    return this.s.nameOf.get(voter) ?? "";
   }
 
   // Not in the contract: the voter's parent (address1 for the root).

@@ -15,6 +15,8 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  statSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -38,6 +40,24 @@ export type CommunityInfo = {
 };
 
 export type CommunitySettings = Pick<CommunityInfo, "name" | "description" | "visibility" | "joinPolicy">;
+
+// How the log stores a join policy. "closed" is written as "invite" plus
+// closed: true, because code from before "closed" existed treats any policy
+// but "invite" as open: rolled back to it, a closed community becomes invite
+// only, not open to anyone. Older entries hold "closed" itself, read the same.
+type Stored<T extends { joinPolicy: CommunityInfo["joinPolicy"] }> = Omit<T, "joinPolicy"> & {
+  joinPolicy: CommunityInfo["joinPolicy"];
+  closed?: boolean;
+};
+
+function toStored<T extends { joinPolicy: CommunityInfo["joinPolicy"] }>(x: T): Stored<T> {
+  return x.joinPolicy === "closed" ? { ...x, joinPolicy: "invite", closed: true } : { ...x, closed: false };
+}
+
+function fromStored<T extends { joinPolicy: CommunityInfo["joinPolicy"] }>(x: Stored<T>): T {
+  const { closed, ...rest } = x;
+  return (closed === true ? { ...rest, joinPolicy: "closed" } : rest) as unknown as T;
+}
 
 // The commons, which every log has implicitly. Settings changes are stored
 // like any other community's.
@@ -102,21 +122,29 @@ export type Poll = {
   options: string[];
   // voter id -> option index
   votes: Map<string, number>;
-  // set when closed: the reputation-weighted total per option at that moment
-  closed?: { at: string; tally: string[] };
+  // voter id -> when they last voted
+  votedAt: Map<string, string>;
+  // set when closed: the reputation-weighted total per option at that moment,
+  // and (closed since it's logged) how many counted voters each had
+  closed?: { at: string; tally: string[]; voters?: number[] };
 };
 
 type Entry =
   | { type: "seed"; at: string; graph: SeedGraph }
-  | { type: "community"; at: string; community: CommunityInfo }
-  | { type: "communityUpdate"; at: string; id: string; settings: CommunitySettings }
-  | { type: "commonsMoved"; at: string; to: CommunityInfo; commonsFounder: string }
+  | { type: "community"; at: string; community: Stored<CommunityInfo> }
+  | { type: "communityUpdate"; at: string; id: string; settings: Stored<CommunitySettings> }
+  | { type: "commonsMoved"; at: string; to: Stored<CommunityInfo>; commonsFounder: string }
   // a one-time change made on startup (e.g. the demo's story), so it isn't redone
   | { type: "migration"; at: string; id: string }
   | { type: "passkey"; at: string; user: StoredUser; passkey: StoredPasskey }
   | { type: "passkeyAdded"; at: string; passkey: StoredPasskey }
   | { type: "counter"; at: string; id: string; counter: number }
   | { type: "recovery"; at: string; userId: string; hash: string }
+  // ends every session of the user (bumps its session version)
+  | { type: "signOutAll"; at: string; userId: string }
+  // a completed recovery: the new passkey replaces the user's others, the code
+  // is replaced and every session ends, all at once
+  | { type: "recovered"; at: string; userId: string; passkey: StoredPasskey; hash: string }
   | { type: "name"; at: string; userId: string; name: string }
   | { type: "invite"; at: string; invite: Invite }
   | { type: "profile"; at: string; userId: string; bio: string; link: string }
@@ -130,7 +158,7 @@ type Entry =
       options: string[];
     }
   | { type: "pollVote"; at: string; pollId: string; by: string; option: number }
-  | { type: "pollClose"; at: string; pollId: string; tally: string[] }
+  | { type: "pollClose"; at: string; pollId: string; tally: string[]; voters?: number[] }
   | ActionEntry;
 
 export class Store {
@@ -139,6 +167,7 @@ export class Store {
   private users = new Map<string, StoredUser>();
   private passkeys = new Map<string, StoredPasskey>();
   private recoveryHashes = new Map<string, string>(); // userId -> hash
+  private sessionVersions = new Map<string, number>(); // userId -> version, default 0
   private invites = new Map<string, Invite>();
   private profiles = new Map<string, Profile>();
   private pollsById = new Map<string, Poll>();
@@ -148,6 +177,12 @@ export class Store {
   private originalTree = DEFAULT_COMMUNITY;
   private migrations = new Set<string>();
   private actionEntries: ActionEntry[] = [];
+  // "<entry's community field> <user>" -> when they last joined that tree
+  // (untagged entries are resolved when asked: see communityOf)
+  private joins = new Map<string, string>();
+  // the log may not end with a newline (a write was cut short): the next entry
+  // starts on a new line
+  private needsNewline = false;
 
   constructor(dir: string) {
     mkdirSync(dir, { recursive: true });
@@ -157,10 +192,45 @@ export class Store {
     if (!existsSync(this.logPath)) {
       return;
     }
-    for (const line of readFileSync(this.logPath, "utf8").split("\n")) {
+    const raw = readFileSync(this.logPath);
+    const lines = raw.toString("utf8").split("\n");
+    let lastLine = lines.length - 1;
+    while (lastLine > 0 && lines[lastLine].trim() === "") lastLine--;
+    let offset = 0; // bytes before the current line
+    let torn = false;
+    for (const [i, line] of lines.entries()) {
+      const start = offset;
+      offset += Buffer.byteLength(line) + 1;
       if (line.trim() === "") continue;
-      this.apply(JSON.parse(line, bigintReviver) as Entry);
+      let entry: Entry;
+      try {
+        entry = JSON.parse(line, bigintReviver) as Entry;
+      } catch (e) {
+        if (i !== lastLine) throw new Error(`${this.logPath} line ${i + 1} is corrupt: ${e}`);
+        // A crash or a full disk in the middle of the last write: that entry
+        // never happened. Keep its bytes aside and cut it off, so the log
+        // stays one entry per line.
+        // (Keeping them can fail on the full disk that cut them short: the
+        // log then just shows their start, and they're cut off anyway.)
+        const tornBytes = raw.subarray(start);
+        const aside = `${this.logPath}.torn-${now().replace(/[:.]/g, "-")}`;
+        let kept = `kept in ${aside}`;
+        try {
+          writeFileSync(aside, tornBytes);
+        } catch (e) {
+          kept = `not kept (${e}); they began ${JSON.stringify(tornBytes.subarray(0, 200).toString("utf8"))}`;
+        }
+        truncateSync(this.logPath, start);
+        torn = true;
+        console.error(
+          `WARNING: the last line of ${this.logPath} was cut short and is skipped (${tornBytes.length} bytes, ${kept}).`,
+        );
+        break;
+      }
+      this.apply(entry);
     }
+    // a complete last entry whose newline wasn't written
+    this.needsNewline = !torn && raw.length > 0 && raw[raw.length - 1] !== 0x0a;
   }
 
   get seed() {
@@ -199,7 +269,7 @@ export class Store {
   // starts its tree.
   moveCommons(to: CommunityInfo, commonsFounder: string) {
     if (this.originalTree !== DEFAULT_COMMUNITY) throw new Error("already moved");
-    this.append({ type: "commonsMoved", at: now(), to, commonsFounder });
+    this.append({ type: "commonsMoved", at: now(), to: toStored(to), commonsFounder });
   }
 
   // One-time changes made on startup.
@@ -215,11 +285,11 @@ export class Store {
   //// communities
 
   addCommunity(community: CommunityInfo) {
-    this.append({ type: "community", at: now(), community });
+    this.append({ type: "community", at: now(), community: toStored(community) });
   }
 
   updateCommunity(id: string, settings: CommunitySettings) {
-    this.append({ type: "communityUpdate", at: now(), id, settings });
+    this.append({ type: "communityUpdate", at: now(), id, settings: toStored(settings) });
   }
 
   community(id: string) {
@@ -263,7 +333,25 @@ export class Store {
     this.append({ type: "recovery", at: now(), userId, hash });
   }
 
-  // The account name. Joining or renaming in a tree also sets it (see apply).
+  recoveryHashOf(userId: string) {
+    return this.recoveryHashes.get(userId);
+  }
+
+  recover(userId: string, passkey: StoredPasskey, hash: string) {
+    this.append({ type: "recovered", at: now(), userId, passkey, hash });
+  }
+
+  // Session tokens carry this; a token with an older one is refused.
+  sessionVersion(userId: string) {
+    return this.sessionVersions.get(userId) ?? 0;
+  }
+
+  signOutAll(userId: string) {
+    this.append({ type: "signOutAll", at: now(), userId });
+  }
+
+  // The account name. Joining or renaming in a tree also sets it (see apply):
+  // old entries may carry another name; new ones always carry this one.
   setUserName(userId: string, name: string) {
     this.append({ type: "name", at: now(), userId, name });
   }
@@ -319,8 +407,8 @@ export class Store {
     this.append({ type: "pollVote", at: now(), pollId, by, option });
   }
 
-  closePoll(pollId: string, tally: string[]) {
-    this.append({ type: "pollClose", at: now(), pollId, tally });
+  closePoll(pollId: string, tally: string[], voters: number[]) {
+    this.append({ type: "pollClose", at: now(), pollId, tally, voters });
   }
 
   poll(id: string) {
@@ -331,6 +419,14 @@ export class Store {
     return [...this.pollsById.values()].filter((p) => this.communityOf(p) === community);
   }
 
+  // When `userId` last joined the community's tree (undefined: never through
+  // the log, e.g. the seeded members).
+  joinedAt(community: string, userId: string) {
+    const tagged = this.joins.get(`${community} ${userId}`);
+    const untagged = community === this.originalTree ? this.joins.get(` ${userId}`) : undefined;
+    return untagged === undefined || (tagged !== undefined && tagged > untagged) ? tagged : untagged;
+  }
+
   sessionSecret(generate: () => string): string {
     if (!existsSync(this.secretPath)) {
       writeFileSync(this.secretPath, generate(), { mode: 0o600 });
@@ -338,8 +434,30 @@ export class Store {
     return readFileSync(this.secretPath, "utf8").trim();
   }
 
+  // Written before it's applied, so memory never holds what the log doesn't.
   private append(entry: Entry) {
-    appendFileSync(this.logPath, `${JSON.stringify(entry, bigintReplacer)}\n`);
+    const line = `${JSON.stringify(entry, bigintReplacer)}\n`;
+    const sizeBefore = existsSync(this.logPath) ? statSync(this.logPath).size : 0;
+    try {
+      appendFileSync(this.logPath, this.needsNewline ? `\n${line}` : line);
+    } catch (e) {
+      // Part of the line may have been written (a full disk): cut it off, or
+      // the next entry would leave it as a corrupt line mid-log, which stops
+      // the server from starting.
+      try {
+        if (existsSync(this.logPath) && statSync(this.logPath).size !== sizeBefore) {
+          truncateSync(this.logPath, sizeBefore);
+        }
+      } catch (cut) {
+        // at least the next entry starts on its own line
+        this.needsNewline = true;
+        console.error(
+          `WARNING: a failed write to ${this.logPath} may have left part of a line at byte ${sizeBefore}, which couldn't be cut off (${cut}). Remove it before the next start.`,
+        );
+      }
+      throw e;
+    }
+    this.needsNewline = false;
     this.apply(entry);
   }
 
@@ -349,10 +467,10 @@ export class Store {
         this.seedGraph = entry.graph;
         break;
       case "community":
-        this.communityById.set(entry.community.id, { ...entry.community });
+        this.communityById.set(entry.community.id, fromStored(entry.community));
         break;
       case "commonsMoved":
-        this.communityById.set(entry.to.id, { ...entry.to });
+        this.communityById.set(entry.to.id, fromStored(entry.to));
         this.communityById.set(DEFAULT_COMMUNITY, {
           ...defaultCommunity(),
           createdBy: entry.commonsFounder,
@@ -365,7 +483,7 @@ export class Store {
         break;
       case "communityUpdate": {
         const c = this.communityById.get(entry.id);
-        if (c !== undefined) this.communityById.set(entry.id, { ...c, ...entry.settings });
+        if (c !== undefined) this.communityById.set(entry.id, { ...c, ...fromStored(entry.settings) });
         break;
       }
       case "passkey":
@@ -382,6 +500,15 @@ export class Store {
       }
       case "recovery":
         this.recoveryHashes.set(entry.userId, entry.hash);
+        break;
+      case "signOutAll":
+        this.sessionVersions.set(entry.userId, this.sessionVersion(entry.userId) + 1);
+        break;
+      case "recovered":
+        for (const p of this.passkeysOf(entry.userId)) this.passkeys.delete(p.id);
+        this.passkeys.set(entry.passkey.id, { ...entry.passkey });
+        this.recoveryHashes.set(entry.userId, entry.hash);
+        this.sessionVersions.set(entry.userId, this.sessionVersion(entry.userId) + 1);
         break;
       case "name": {
         const user = this.users.get(entry.userId);
@@ -403,14 +530,18 @@ export class Store {
           question: entry.question,
           options: entry.options,
           votes: new Map(),
+          votedAt: new Map(),
         });
         break;
-      case "pollVote":
-        this.pollsById.get(entry.pollId)?.votes.set(entry.by, entry.option);
+      case "pollVote": {
+        const poll = this.pollsById.get(entry.pollId);
+        poll?.votes.set(entry.by, entry.option);
+        poll?.votedAt.set(entry.by, entry.at);
         break;
+      }
       case "pollClose": {
         const poll = this.pollsById.get(entry.pollId);
-        if (poll !== undefined) poll.closed = { at: entry.at, tally: entry.tally };
+        if (poll !== undefined) poll.closed = { at: entry.at, tally: entry.tally, voters: entry.voters };
         break;
       }
       case "action": {
@@ -419,6 +550,9 @@ export class Store {
         if (action.fn === "changeName" || action.fn === "joinTree") {
           const user = this.users.get(entry.by);
           if (user !== undefined) user.name = action.args.name;
+        }
+        if (action.fn === "joinTree" || action.fn === "joinTreeAsRoot") {
+          this.joins.set(`${entry.community ?? ""} ${entry.by}`, entry.at);
         }
         if (action.fn === "joinTree" && action.args.invite !== undefined) {
           const invite = this.invites.get(action.args.invite);

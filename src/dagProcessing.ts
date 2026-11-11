@@ -3,10 +3,11 @@ import type { GraphData } from "./dagBase";
 //////////////
 ///// Process
 
+// relRoot is the ancestor maxRelRootDepth levels up (or the root), the same
+// as the contract's findRelRoot. The window holds the last maxRelRootDepth
+// ancestors, oldest first.
 export function calculateDepthAndRelRoot(dag: GraphData, depthA: string[][]) {
-  var parentsArray = Array.apply(null, Array(5)).map(() => {
-    return dag.rootId;
-  });
+  var parentsArray = Array.from({ length: dag.maxRelRootDepth || 6 }, () => dag.rootId);
   calculateDepthAndRelRootInner(dag, depthA, dag.rootId, 0, parentsArray);
 }
 

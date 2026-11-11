@@ -30,3 +30,8 @@ services:
       # set to "true" once real members can invite everyone else
       - key: INVITE_ONLY
         value: "false"
+      # Client IPs (for rate limits) are the X-Forwarded-For entry Render's
+      # proxy adds, skipping Cloudflare's hops. After a deploy, check the
+      # "client IPs:" line in the log; if it shows the setup differs, set
+      # TRUSTED_PROXY_HOPS (proxies that add an entry) or TRUST_CLOUDFLARE=true
+      # (use CF-Connecting-IP, only if Cloudflare always overwrites it here).

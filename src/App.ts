@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { serve } from "@hono/node-server";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import type { WSContext } from "hono/ws";
 import type { Address, Log } from "viem";
@@ -46,7 +47,11 @@ import { offchainServer } from "./offchainApi";
 // Spinning the Hono http server and the WebSocket server on the same port.
 const app = new Hono();
 
-const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
+const { injectWebSocket, upgradeWebSocket, wss } = createNodeWebSocket({ app });
+// Clients only listen; a frame bigger than this closes the socket before it's
+// buffered (ws's default is 100 MiB). @hono/node-ws takes no options, but ws
+// reads this on every upgrade.
+wss.options.maxPayload = 1024;
 
 let port = process.env.PORT;
 
@@ -56,12 +61,38 @@ if (port == null || port == "") {
 
 // I'm maintaining all active connections in this object
 const clients: { [id: string]: WSContext } = {};
+// open sockets per client IP, capped against floods only: a meetup on one
+// Wi-Fi or a carrier's NAT is many people, a tab or two each (the heartbeat
+// below closes the dead ones)
+const socketsPerIp = new Map<string, number>();
+const MAX_SOCKETS_PER_IP = 300;
+// sockets that haven't answered the last ping: closed at the next one, so
+// half-open connections (a phone that went away) don't pile up
+const HEARTBEAT_MS = 30_000;
+const unanswered = new Set<string>();
 
 function broadcast(message: string) {
   Object.values(clients).forEach((client) => {
     client.send(message);
   });
 }
+
+setInterval(() => {
+  for (const [id, client] of Object.entries(clients)) {
+    const raw = client.raw as import("ws").WebSocket | undefined;
+    if (raw === undefined) continue;
+    if (unanswered.has(id)) {
+      raw.terminate();
+      continue;
+    }
+    unanswered.add(id);
+    try {
+      raw.ping();
+    } catch {
+      raw.terminate();
+    }
+  }
+}, HEARTBEAT_MS).unref();
 
 // Three modes:
 // - off-chain (default): the trees live on this server (see offchain.ts and
@@ -102,23 +133,40 @@ app.use(
 // chain, "update:<community>") to all clients on graph changes.
 app.get(
   "/",
-  upgradeWebSocket(() => {
+  async (c, next) => {
+    if (c.req.header("upgrade")?.toLowerCase() === "websocket") {
+      const ip = clientIp(c);
+      if ((socketsPerIp.get(ip) ?? 0) >= MAX_SOCKETS_PER_IP) {
+        return c.json({ error: "Too many connections." }, 429);
+      }
+    }
+    await next();
+  },
+  upgradeWebSocket((c) => {
     const userId = randomUUID();
+    const ip = clientIp(c);
+    let open = false;
     return {
       onOpen(_event, ws) {
-        console.log(`Recieved a new connection.`);
+        open = true;
         clients[userId] = ws;
-        console.log(`${userId} connected.`);
+        socketsPerIp.set(ip, (socketsPerIp.get(ip) ?? 0) + 1);
+        (ws.raw as import("ws").WebSocket | undefined)?.on("pong", () => unanswered.delete(userId));
         ws.send("Hello from the server");
       },
-      onMessage(event) {
-        console.log("received: %s", event.data);
-      },
+      // clients have nothing to say: what they send is ignored, not logged
+      onMessage() {},
       onError(err) {
-        console.log(err);
+        console.log("websocket:", err.type);
       },
       onClose() {
         delete clients[userId];
+        unanswered.delete(userId);
+        if (!open) return;
+        open = false;
+        const left = (socketsPerIp.get(ip) ?? 1) - 1;
+        if (left > 0) socketsPerIp.set(ip, left);
+        else socketsPerIp.delete(ip);
       },
     };
   }),
@@ -129,7 +177,7 @@ app.get(
 
 app.onError((err, c) => {
   if (err instanceof AuthError) {
-    return c.json({ error: err.message }, 401);
+    return c.json({ error: err.message, code: err.code }, 401);
   }
   if (err instanceof ActionError) {
     return c.json({ error: err.message, code: err.code }, 400);
@@ -138,14 +186,31 @@ app.onError((err, c) => {
     return c.json({ error: "Not found" }, 404);
   }
   if (err instanceof RateLimitError) {
-    return c.json({ error: "Too many requests, try again in a minute." }, 429);
+    const seconds = Math.max(1, Math.ceil((err.retryAt - Date.now()) / 1000));
+    c.header("Retry-After", String(seconds));
+    const minutes = Math.ceil(seconds / 60);
+    const when =
+      minutes <= 1 ? "in a minute" : minutes <= 90 ? `in ${minutes} minutes` : `in ${Math.ceil(minutes / 60)} hours`;
+    return c.json({ error: `Too many requests, try again ${when}.` }, 429);
   }
   console.error(err);
   return c.json({ error: "internal error" }, 500);
 });
 
+// Every body is small JSON (a passkey response is a few KB): anything bigger
+// is refused before it's read.
+app.use(
+  "*",
+  bodyLimit({
+    maxSize: 64 * 1024,
+    onError: (c) => c.json({ error: "Request body too large." }, 413),
+  }),
+);
+
+// The passkey ceremonies, per IP: room for a meetup on one Wi-Fi signing up
+// together. Reads (GET /auth/me, on every page load) don't count.
 app.use("/auth/*", async (c, next) => {
-  rateLimit(`auth:${clientIp(c)}`, 30);
+  if (c.req.method !== "GET") rateLimit(`auth:${clientIp(c)}`, 60);
   await next();
 });
 app.use("*", async (c, next) => {

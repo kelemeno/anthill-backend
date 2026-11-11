@@ -1,11 +1,13 @@
 // End-to-end smoke test of off-chain mode: drives a running backend with a
 // software passkey (P-256, "none" attestation) the way a browser would.
-// Checks the commons starts empty and only its founder can start it. In the
+// Checks the commons starts empty (with no founder on a fresh data dir). In the
 // demo (the seeded tree): registers, signs in, joins, votes, renames, checks
 // why actions fail, invites
 // a second user, sets a profile, runs a poll, starts public and private
-// communities (joining, invites, privacy, settings, renaming across them, an
-// emptied tree), adds a second passkey, recovers with the recovery code and
+// communities (joining, invites, privacy, settings, renaming across them, one
+// name per account, update keys, name cleaning, body limits, no-op writes,
+// poll caps and leavers' votes, an emptied tree), adds a second passkey, recovers with the recovery code (which
+// ends old sessions and passkeys, once per code), signs out everywhere and
 // downloads the log as admin.
 //
 //   PORT=5098 DATA_DIR=/tmp/anthill-smoke ADMIN_TOKEN=smoke-admin npx tsx src/App.ts
@@ -92,17 +94,56 @@ async function main() {
   const me = await call("auth/me", undefined, session.token);
   assert.deepEqual(me.data.user, session.user);
 
-  // A forged token is refused.
-  const forged = `${session.token.split(".")[0]}.AAAA`;
-  assert.equal((await call("auth/me", undefined, forged)).status, 401);
+  // A forged token is refused, also a malformed one (non-ASCII, the
+  // signature's length in characters but not in bytes) or one with a tail.
+  const [payload, signature] = session.token.split(".");
+  for (const bad of [
+    `${payload}.AAAA`,
+    `${payload}.${"\u00e9".repeat(signature.length)}`,
+    `${session.token}.extra`,
+    `e30.${signature}`,
+  ]) {
+    assert.equal((await call("auth/me", undefined, bad)).status, 401, bad);
+  }
+  {
+    const res = await fetch(`${backend}admin/log`, { headers: { Authorization: "Bearer \u00e9" } });
+    assert.equal(res.status, 401);
+  }
 
-  // The commons is empty, and only its founder can start it.
+  // Passkeys are asked to verify the user, which the server requires.
+  assert.equal(
+    (await call("auth/login/options", {})).data.options.userVerification,
+    "required",
+  );
+  // A sign-in without a passkey response is a 400 and leaves the flow usable.
+  {
+    const options = await call("auth/login/options", {});
+    for (const body of [{ flowId: options.data.flowId }, { flowId: options.data.flowId, response: null }]) {
+      assert.equal((await call("auth/login/verify", body)).status, 400, JSON.stringify(body));
+    }
+    const verified = await call("auth/login/verify", {
+      flowId: options.data.flowId,
+      response: passkey.get(options.data.options),
+    });
+    assert.equal(verified.status, 200, JSON.stringify(verified.data));
+  }
+  // Reads of the session don't use up the sign-in rate limit.
+  for (let i = 0; i < 70; i++) await call("auth/me", undefined, session.token);
+  assert.equal((await call("auth/login/options", {})).status, 200);
+  console.log("ok: malformed tokens and passkey responses");
+
+  // The commons is empty. A fresh data dir has no COMMONS_FOUNDER account, so
+  // it has no founder and anyone could start it (left empty here).
   const commons = (await call("graph")).data;
   assert.equal(commons.community.id, "commons");
   assert.deepEqual(commons.nodes, {});
-  const notFounder = await call("action", { fn: "joinTreeAsRoot", args: { name: "Smoke" } }, session.token);
-  assert.equal(notFounder.status, 400);
-  assert.match(notFounder.data.error, /founder/);
+  assert.equal(commons.community.founder, null);
+  const startable = await call(
+    "check",
+    { actions: [{ fn: "joinTreeAsRoot", args: { name: "Smoke" } }] },
+    session.token,
+  );
+  assert.deepEqual(startable.data.results, [{ ok: true }]);
 
   // The demo (the seeded tree) is invite only: join under a leaf with an
   // admin invite.
@@ -197,6 +238,38 @@ async function main() {
   assert.equal(selfVote.ok, false);
   assert.equal((await nodeOf(session.user.id)).name, "Smoke 2");
   console.log("ok: dry-run reasons");
+
+  // Malformed bodies are a 400, and a dry run still answers the other items.
+  for (const body of [null, [], "x"]) {
+    assert.equal((await call(`${D}action`, body, session.token)).status, 400, JSON.stringify(body));
+    assert.equal((await call(`${D}check`, body, session.token)).status, 400, JSON.stringify(body));
+    assert.equal((await call("auth/register/options", body)).status, 400, JSON.stringify(body));
+  }
+  const nullArgs = await call(`${D}action`, { fn: "addDagVote", args: null }, session.token);
+  assert.equal(nullArgs.status, 400);
+  const mixed = await call(
+    `${D}check`,
+    { actions: [{ fn: "joinTree", args: null }, { fn: "changeName", args: { name: "Fine" } }] },
+    session.token,
+  );
+  assert.equal(mixed.status, 200, JSON.stringify(mixed.data));
+  assert.deepEqual(
+    mixed.data.results.map((r: any) => r.ok),
+    [false, true],
+  );
+  // a dry run is a few actions at a time
+  const many = Array(6).fill({ fn: "changeName", args: { name: "Fine" } });
+  assert.equal((await call(`${D}check`, { actions: many }, session.token)).status, 400);
+  // the engine's scratch node and sentinels are nobody to move under
+  for (const recipient of [
+    "0x0000000000000000000000000000000099999999",
+    "0x0000000000000000000000000000000000000001",
+  ]) {
+    const ghost = await call(`${D}action`, { fn: "moveTreeVote", args: { recipient } }, session.token);
+    assert.equal(ghost.status, 400);
+    assert.equal(ghost.data.error, "That person isn't in the tree.");
+  }
+  console.log("ok: malformed bodies and sentinels");
 
   // Invites: a second person joins under the inviter.
   // The demo is closed: members can't invite, only an admin can.
@@ -396,6 +469,171 @@ async function main() {
   }
   console.log("ok: rename across communities");
 
+  // The history is sent gzipped; renaming to the same name adds no step.
+  const demoHistory = async () => {
+    const res = await fetch(`${backend}c/demo/history`, { headers: { "Accept-Encoding": "gzip" } });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-encoding"), "gzip");
+    return ((await res.json()) as { steps: { index: number; eventName: string; nodes: unknown[] }[] }).steps;
+  };
+  const steps = await demoHistory();
+  assert.equal(steps.at(-1)!.eventName, "ChangeNameEvent");
+  assert.ok(steps.at(-1)!.nodes.length > 60);
+  assert.equal((await call("name", { name: "Smoke 3" }, session.token)).status, 200);
+  assert.equal((await demoHistory()).length, steps.length);
+  console.log("ok: history,", steps.length, "steps");
+
+  // One name per account. A join takes the account's name, not a stale one
+  // from the client; changeName as an action renames the account everywhere.
+  const sockets: string[] = [];
+  const socket = new WebSocket(backend.replace(/^http/, "ws"));
+  socket.onmessage = (event) => sockets.push(String(event.data));
+  await new Promise((resolve) => (socket.onopen = resolve));
+  const stale = await call(
+    "communities",
+    { id: "smoke-stale", name: "Stale", visibility: "public", joinPolicy: "open" },
+    friend.token,
+  );
+  assert.equal(stale.status, 200, JSON.stringify(stale.data));
+  const staleJoin = await call(
+    "c/smoke-stale/action",
+    { fn: "joinTree", args: { name: "Smoke", recipient: friend.user.id } },
+    session.token,
+  );
+  assert.equal(staleJoin.status, 200, JSON.stringify(staleJoin.data));
+  assert.equal((await nodeOf(session.user.id, "smoke-stale")).name, "Smoke 3");
+  assert.equal((await call("auth/me", undefined, session.token)).data.user.name, "Smoke 3");
+  const actionRename = await call(
+    "c/smoke-stale/action",
+    { fn: "changeName", args: { name: "Smoke 4" } },
+    session.token,
+  );
+  assert.equal(actionRename.status, 200, JSON.stringify(actionRename.data));
+  assert.equal((await call("auth/me", undefined, session.token)).data.user.name, "Smoke 4");
+  for (const cid of ["demo", "smoke-public", "smoke-private", "smoke-stale"]) {
+    const n = (await call(`c/${cid}/graph`, undefined, session.token)).data.nodes[session.user.id];
+    assert.equal(n.name, "Smoke 4", cid);
+  }
+  const notInTree = await call(
+    "c/smoke-stale/action",
+    { fn: "changeName", args: { name: "Sneaky" } },
+    outsider.token,
+  );
+  assert.equal(notInTree.status, 400);
+  assert.equal((await call("auth/me", undefined, outsider.token)).data.user.name, "Outsider");
+  console.log("ok: joins and renames keep one name per account");
+
+  // Updates name the community; a private one by its opaque key.
+  const privGraph = (await call("c/smoke-private/graph", undefined, session.token)).data;
+  assert.equal((await call("c/smoke-stale/graph")).data.updateKey, "smoke-stale");
+  assert.match(privGraph.updateKey, /^p_[0-9a-f]{24}$/);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.ok(sockets.includes(`update:${privGraph.updateKey}`), JSON.stringify(sockets));
+  assert.ok(sockets.includes("update:smoke-stale"), JSON.stringify(sockets));
+  assert.ok(!sockets.some((m) => m === "update" || m.includes("smoke-private")), JSON.stringify(sockets));
+  socket.close();
+  console.log("ok: private updates are broadcast by key");
+
+  // Names lose invisible and direction-changing characters.
+  const evil = await register(new SoftPasskey(), "\u202eEvil\u200b  Name\u0007 ");
+  assert.equal(evil.user.name, "Evil Name");
+  assert.equal((await call("auth/register/options", { name: "\u200b\u2800 \u202e" })).status, 400);
+  assert.equal((await call("name", { name: "\u2066\u2069" }, friend.token)).status, 400);
+  console.log("ok: names are cleaned");
+
+  // Bodies are small: a big one is refused before it's read.
+  const big = JSON.stringify({ bio: "x".repeat(100_000) });
+  const tooBig = await fetch(`${backend}profile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${friend.token}` },
+    body: big,
+  });
+  assert.equal(tooBig.status, 413);
+  const chunked = await fetch(`${backend}auth/login/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(big));
+        controller.close();
+      },
+    }),
+    duplex: "half",
+  } as RequestInit);
+  assert.equal(chunked.status, 413);
+  console.log("ok: body size limit");
+
+  // Writes that change nothing aren't logged.
+  const logLines = async () => {
+    const res = await fetch(`${backend}admin/log`, {
+      headers: { Authorization: `Bearer ${process.env.ADMIN_TOKEN}` },
+    });
+    return (await res.text()).trim().split("\n").length;
+  };
+  {
+    const lines = await logLines();
+    const same = await call("profile", { bio: "Smoke tester", link: "https://example.com" }, session.token);
+    assert.equal(same.status, 200);
+    assert.equal((await call("name", { name: "Smoke 4" }, session.token)).status, 200);
+    const unchanged = { name: "Smoke Society", visibility: "public", joinPolicy: "invite" };
+    assert.equal((await call("c/smoke-public/settings", unchanged, session.token)).status, 200);
+    assert.equal(await logLines(), lines);
+  }
+
+  // Polls: each member has a few open ones at most. Only members' votes count:
+  // whoever leaves loses theirs (also when they come back), and the founder
+  // can close a poll whose creator left.
+  {
+    const ask = (question: string) =>
+      call("c/smoke-stale/polls", { question, options: ["Yes", "No"] }, session.token);
+    const asked = [];
+    for (let i = 0; i < 5; i++) {
+      const res = await ask(`Question ${i}?`);
+      assert.equal(res.status, 200, JSON.stringify(res.data));
+      asked.push(res.data.poll.id as string);
+    }
+    const sixth = await ask("One more?");
+    assert.equal(sixth.status, 400);
+    assert.match(sixth.data.error, /5 open polls/);
+    const [first, second] = asked;
+    for (const id of [first, second]) {
+      assert.equal((await call(`c/smoke-stale/polls/${id}/vote`, { option: 0 }, session.token)).status, 200);
+      assert.equal((await call(`c/smoke-stale/polls/${id}/vote`, { option: 1 }, friend.token)).status, 200);
+    }
+    const lines = await logLines();
+    assert.equal((await call(`c/smoke-stale/polls/${first}/vote`, { option: 0 }, session.token)).status, 200);
+    assert.equal(await logLines(), lines);
+    const pollOf = async (id: string, token: string) =>
+      (await call("c/smoke-stale/polls", undefined, token)).data.polls.find((p: any) => p.id === id);
+    assert.equal((await pollOf(first, friend.token)).canClose, false);
+    assert.equal((await pollOf(first, session.token)).canClose, true);
+    assert.equal((await call(`c/smoke-stale/polls/${first}/close`, {}, friend.token)).status, 400);
+
+    assert.equal((await call("c/smoke-stale/action", { fn: "leaveTree" }, session.token)).status, 200);
+    let left = await pollOf(first, friend.token);
+    assert.deepEqual(left.tally.map((t: any) => t.voters), [0, 1]);
+    assert.equal(left.tally[0].weight, "0");
+    assert.equal(left.canClose, true);
+    const founderClose = await call(`c/smoke-stale/polls/${first}/close`, {}, friend.token);
+    assert.equal(founderClose.status, 200, JSON.stringify(founderClose.data));
+    assert.deepEqual(founderClose.data.poll.tally.map((t: any) => t.voters), [0, 1]);
+
+    // back in the tree: the old vote on the open poll doesn't count again
+    const back = await call(
+      "c/smoke-stale/action",
+      { fn: "joinTree", args: { name: "Old Name", recipient: friend.user.id } },
+      session.token,
+    );
+    assert.equal(back.status, 200, JSON.stringify(back.data));
+    assert.equal((await nodeOf(session.user.id, "smoke-stale")).name, "Smoke 4");
+    left = await pollOf(second, session.token);
+    assert.deepEqual(left.tally.map((t: any) => t.voters), [0, 1]);
+    assert.equal(left.myVote, undefined);
+    assert.equal((await call(`c/smoke-stale/polls/${second}/vote`, { option: 0 }, session.token)).status, 200);
+    assert.deepEqual((await pollOf(second, session.token)).tally.map((t: any) => t.voters), [1, 1]);
+  }
+  console.log("ok: poll caps, leavers' votes, founder closes");
+
   // A tree everyone left still serves, and its founder can restart it.
   const solo = await call(
     "communities",
@@ -451,7 +689,56 @@ async function main() {
     401,
   );
   assert.equal((await signIn(newPhone)).user.id, session.user.id);
+  // Recovery ended the earlier sessions and removed the other passkeys.
+  const oldMe = await call("auth/me", undefined, session.token);
+  assert.equal(oldMe.status, 401);
+  assert.equal(oldMe.data.error, "session expired");
+  for (const old of [passkey, laptop]) {
+    const options = await call("auth/login/options", {});
+    const res = await call("auth/login/verify", {
+      flowId: options.data.flowId,
+      response: old.get(options.data.options),
+    });
+    assert.equal(res.status, 401, JSON.stringify(res.data));
+  }
+  assert.equal((await call("auth/me", undefined, recovered.data.token)).status, 200);
   console.log("ok: recovery code");
+
+  // A code is used once: of two flows it opened, only the newest is open, and
+  // a flow dies when the code is replaced.
+  {
+    const code = recovered.data.recoveryCode;
+    const first = await call("auth/recover/options", { code });
+    const second = await call("auth/recover/options", { code });
+    const stale = await call("auth/recover/verify", {
+      flowId: first.data.flowId,
+      response: new SoftPasskey().create(first.data.options),
+    });
+    assert.equal(stale.status, 401, JSON.stringify(stale.data));
+    const rotated = await call("auth/recovery-code", {}, recovered.data.token);
+    assert.equal(rotated.status, 200, JSON.stringify(rotated.data));
+    const afterRotation = await call("auth/recover/verify", {
+      flowId: second.data.flowId,
+      response: new SoftPasskey().create(second.data.options),
+    });
+    assert.equal(afterRotation.status, 401, JSON.stringify(afterRotation.data));
+    assert.equal((await call("auth/me", undefined, recovered.data.token)).status, 200);
+  }
+  console.log("ok: recovery codes are single-use");
+
+  // Sign out everywhere ends every session, the caller's too; the passkey
+  // still signs in.
+  {
+    const a = await signIn(newPhone);
+    const b = await signIn(newPhone);
+    assert.equal((await call("auth/sign-out-everywhere", {}, a.token)).status, 200);
+    for (const t of [a.token, b.token, recovered.data.token]) {
+      assert.equal((await call("auth/me", undefined, t)).status, 401);
+    }
+    const again = await signIn(newPhone);
+    assert.equal((await call("auth/me", undefined, again.token)).status, 200);
+  }
+  console.log("ok: sign out everywhere");
 
   // Admin log download.
   assert.equal((await call("admin/log")).status, 401);

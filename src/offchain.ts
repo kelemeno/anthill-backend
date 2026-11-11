@@ -9,11 +9,13 @@
 //
 // Joining: with an invite code, the newcomer is placed under the inviter (or
 // the nearest free spot below them). In a community whose join policy is
-// "invite" (always the case for private ones) an invite is required; otherwise
-// anyone can join under any node with a free spot.
+// "invite" (always the case for private ones) an invite is required; in an
+// "open" one anyone can join under any node with a free spot; a "closed" one
+// takes nobody new (except through an admin's invite). Any other policy is
+// treated as closed to newcomers without an invite.
 
 import { randomBytes } from "node:crypto";
-import { AnthillEngine, type EngineEvent, Revert } from "./engine";
+import { AnthillEngine, address0, address1, type EngineEvent, Revert, tempAddress } from "./engine";
 import { explain } from "./reasons";
 import {
   type Action,
@@ -36,6 +38,11 @@ const MAX_COMMUNITIES_PER_FOUNDER = 10;
 // Lowercase letters, digits and dashes, 3-32 long; used in URLs (/c/<id>).
 const COMMUNITY_ID = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
 const RESERVED_IDS = new Set(["admin", "api", "c", "demo", "new", "p", "invite", "settings", "www"]);
+// The engine's sentinels, never a person: the contract lets you join or move
+// under its scratch node (whose sentTreeVote stays address1 after a move),
+// which would put you in a branch the root doesn't reach.
+const SENTINELS = new Set([address0, address1, tempAddress]);
+const NOT_IN_TREE = "Join the tree first.";
 
 export class ActionError extends Error {
   constructor(
@@ -68,19 +75,49 @@ export class OffchainTree {
   visibleTo(viewer: string | undefined): boolean {
     const { visibility, createdBy } = this.info;
     if (visibility === "public") return true;
-    return viewer !== undefined && (viewer === createdBy || this.engine.isInTree(viewer));
+    return viewer !== undefined && (viewer === createdBy || this.isMember(viewer));
+  }
+
+  // In the tree and reachable from its root. The engine's isInTree is also
+  // true for its scratch node and anyone placed under it, a branch the served
+  // graph (crawled from the root) never shows; the API never lets anyone get
+  // there, and treats whoever is there as outside the tree.
+  isMember(id: string): boolean {
+    if (SENTINELS.has(id) || !this.engine.isInTree(id)) return false;
+    const seen = new Set<string>();
+    let at = id;
+    for (let parent = this.engine.parent(at); parent !== address1; parent = this.engine.parent(at)) {
+      if (parent === address0 || SENTINELS.has(parent) || seen.has(parent)) return false;
+      seen.add(parent);
+      at = parent;
+    }
+    return at === this.engine.root();
+  }
+
+  // Members the root doesn't reach (see isMember); reported on startup.
+  detached(): string[] {
+    return this.engine.members().filter((id) => !this.isMember(id));
   }
 
   // Validate, run and persist one action by a signed-in user.
   execute(by: string, body: unknown): Executed {
     const action = this.prepare(by, parseAction(body));
     let events: EngineEvent[];
+    let entry: ActionEntry | undefined;
+    let applied = false;
     try {
-      events = this.engine.run((e) => apply(e, by, action));
+      events = this.engine.run((e) => {
+        apply(e, by, action);
+        applied = true;
+        // logged inside the run: if the write fails (a full disk), the engine
+        // is rolled back too, so it never holds what the log doesn't
+        entry = this.store.appendAction(this.id, by, action);
+      });
     } catch (e) {
+      if (applied) throw e;
       throw this.toActionError(by, action, e);
     }
-    return { tree: this, entry: this.store.appendAction(this.id, by, action), events };
+    return { tree: this, entry: entry!, events };
   }
 
   // Run an action from the log again (on startup).
@@ -103,14 +140,16 @@ export class OffchainTree {
         if (error instanceof ActionError) {
           return { ok: false, reason: error.message, code: error.code };
         }
-        throw error;
+        // a bug, not a reason: logged, and the other items still get answers
+        console.error("check:", body, error);
+        return { ok: false, reason: "That isn't possible right now.", code: "internal" };
       }
     });
   }
 
   // Everyone `voter` could endorse right now but doesn't yet.
   reach(voter: string): string[] {
-    if (!this.engine.isInTree(voter)) return [];
+    if (!this.isMember(voter)) return [];
     return this.engine.members().filter((m) => {
       if (m === voter) return false;
       const { votable, voted } = this.engine.dagVoteState(voter, m);
@@ -123,7 +162,7 @@ export class OffchainTree {
 
   createInvite(by: string): Invite {
     if (this.info.joinPolicy === "closed") throw new ActionError(CLOSED);
-    if (!this.engine.isInTree(by)) {
+    if (!this.isMember(by)) {
       throw new ActionError("Join the tree first, then you can invite people.");
     }
     if (this.store.openInvitesBy(this.id, by).length >= MAX_OPEN_INVITES) {
@@ -136,7 +175,7 @@ export class OffchainTree {
 
   // Admin invite (for bootstrapping an invite-only tree): joins under `under`.
   createAdminInvite(under: string): Invite {
-    if (!this.engine.isInTree(under)) {
+    if (!this.isMember(under)) {
       throw new ActionError("That node isn't in the tree.");
     }
     return this.storeInvite("admin", under);
@@ -168,7 +207,7 @@ export class OffchainTree {
     if (invite.expires < new Date().toISOString()) {
       throw new ActionError("This invite has expired. Ask for a new one.");
     }
-    if (!this.engine.isInTree(invite.under)) {
+    if (!this.isMember(invite.under)) {
       throw new ActionError("The person who invited you is no longer in the tree.");
     }
     return invite;
@@ -188,26 +227,53 @@ export class OffchainTree {
 
   ////////////////////////////////////////////
 
-  // Resolve invite placement and enforce the join policy before the engine
-  // runs.
+  // Resolve invite placement, enforce the join policy and the rules the
+  // server adds before the engine runs. Also answers what's refused anyway
+  // without running the engine (each run clones the whole state).
   private prepare(by: string, action: Action): Action {
     const { joinPolicy, createdBy } = this.info;
+    if (action.fn === "joinTree" || action.fn === "joinTreeAsRoot") {
+      // A node takes the account's name, not the one the client sent (a page
+      // signed in before a rename elsewhere still has the old one); joining
+      // also sets the account name (see Store.apply), so it can't change it.
+      // People without an account (the demo's scripted members) keep theirs.
+      const account = this.store.user(by)?.name;
+      if (account) action = { ...action, args: { ...action.args, name: account } } as Action;
+    }
     if (action.fn === "joinTreeAsRoot") {
       // Only possible in an empty tree (the engine checks that). Starting it
-      // is up to the founder; without one, anyone can unless it's invite-only.
-      if (createdBy !== "" ? by !== createdBy : joinPolicy === "invite") {
+      // is up to the founder; without one (a fresh data dir's commons) anyone
+      // can, unless it's closed: the join policy is about joining a tree
+      // someone started, and an invite needs someone in it to give one.
+      if (createdBy !== "" ? by !== createdBy : joinPolicy === "closed") {
         throw new ActionError("Only the founder can start this community's tree.");
       }
       return action;
     }
-    if (action.fn !== "joinTree") return action;
+    if (action.fn !== "joinTree") {
+      // everything else needs a place in the tree (leaving is always allowed
+      // to whoever the engine has in it)
+      if (!this.engine.isInTree(by) || (action.fn !== "leaveTree" && !this.isMember(by))) {
+        throw new ActionError(NOT_IN_TREE, "not in tree");
+      }
+      if (
+        (action.fn === "moveTreeVote" || action.fn === "addDagVote") &&
+        !this.isMember(action.args.recipient)
+      ) {
+        throw new ActionError("That person isn't in the tree.", "A mTV 3");
+      }
+      return action;
+    }
     const { invite } = action.args;
     if (joinPolicy === "closed" && (invite === undefined || this.store.invite(invite)?.by !== "admin")) {
       throw new ActionError(CLOSED);
     }
     if (invite === undefined) {
-      if (joinPolicy === "invite") {
+      if (joinPolicy !== "open") {
         throw new ActionError("Joining needs an invite from someone in the community.");
+      }
+      if (!this.engine.isInTree(by) && !this.isMember(action.args.recipient)) {
+        throw new ActionError("That person isn't in the tree.", "A lT 3");
       }
       return action;
     }
@@ -264,7 +330,10 @@ export class Communities {
     if (seed !== undefined) {
       this.trees.get(this.store.originalCommunity)!.engine.loadFromGraph(seed);
     }
-    for (const entry of this.store.actions) {
+    // the log as it was when the load started: an action appended meanwhile is
+    // already in its engine
+    const entries = this.store.actions.slice();
+    for (const entry of entries) {
       const tree = this.trees.get(this.store.communityOf(entry));
       let events: EngineEvent[];
       try {
@@ -308,20 +377,29 @@ export class Communities {
   }
 
   // Change a community's name, description, visibility or join policy.
-  updateSettings(by: string, tree: OffchainTree, body: unknown): CommunityInfo {
+  // Returns whether anything changed (unchanged settings aren't logged).
+  updateSettings(by: string, tree: OffchainTree, body: unknown): boolean {
     if (by !== tree.info.createdBy) {
       throw new ActionError("Only the founder can change the community's settings.");
     }
-    this.store.updateCommunity(tree.id, parseSettings(body));
-    return tree.info;
+    const settings = parseSettings(body);
+    const info = tree.info;
+    if ((Object.keys(settings) as (keyof CommunitySettings)[]).every((k) => settings[k] === info[k])) {
+      return false;
+    }
+    this.store.updateCommunity(tree.id, settings);
+    return true;
   }
 
-  // Rename an account, and its node in every tree it's in.
+  // Rename an account, and its node in every tree it's a member of (a node
+  // the root doesn't reach can't act, so it keeps its name rather than making
+  // the whole rename fail). Unchanged names are skipped: each rename is a
+  // history step everywhere.
   rename(user: StoredUser, body: unknown): Executed[] {
     const name = parseName((body as { name?: unknown } | null)?.name);
-    this.store.setUserName(user.id, name);
+    if (this.store.user(user.id)?.name !== name) this.store.setUserName(user.id, name);
     return this.all()
-      .filter((tree) => tree.engine.isInTree(user.id))
+      .filter((tree) => tree.isMember(user.id) && tree.engine.name(user.id) !== name)
       .map((tree) => tree.execute(user.id, { fn: "changeName", args: { name } }));
   }
 }
@@ -352,11 +430,39 @@ function parseSettings(body: unknown): CommunitySettings {
   };
 }
 
-function parseName(v: unknown): string {
-  if (typeof v !== "string" || v.trim() === "" || v.trim().length > MAX_NAME_LENGTH) {
+// Characters that show as nothing or change how the text around them is
+// drawn: controls and line breaks, zero-width and bidi format characters
+// (\p{Cf}, which also has U+200B, U+200E-200F, U+202A-202E, U+2066-2069 and
+// the BOM), and the blank-looking letters and symbols trim() keeps (Hangul
+// fillers, the braille blank). They'd let a name look empty, or like someone
+// else's. Two kinds of format character are kept where text needs them:
+// tag characters in a subdivision flag (🏴 + tags, e.g. Scotland's; matched
+// first, as group 1, and put back), and the zero-width (non-)joiners, which
+// STRAY_JOINER handles.
+const INVISIBLE =
+  /(\u{1F3F4}[\u{E0020}-\u{E007E}]{1,30}\u{E007F})|(?![\u200C\u200D])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u115F\u1160\u2800\u3164\uFFA0]/gu;
+// ZWJ and ZWNJ join emoji (👨‍👩‍👧, 🏳️‍🌈) and shape Arabic-script and Indic
+// words (Persian names, conjuncts); anywhere else (between Latin letters, next
+// to a space, at either end) they're invisible, so they go.
+const STRAY_JOINER =
+  /(?<![\p{Extended_Pictographic}\p{Emoji_Modifier}\uFE0F\p{sc=Arab}\p{sc=Syrc}\p{sc=Nkoo}\p{sc=Mong}\p{sc=Deva}\p{sc=Beng}\p{sc=Guru}\p{sc=Gujr}\p{sc=Orya}\p{sc=Taml}\p{sc=Telu}\p{sc=Knda}\p{sc=Mlym}\p{sc=Sinh}])[\u200C\u200D]|[\u200C\u200D](?=[\s\u200C\u200D]|$)/gu;
+
+// An account or node name as it's stored: invisible characters taken out,
+// runs of spaces made one, trimmed, 1-40 characters.
+export function parseName(v: unknown): string {
+  const name =
+    typeof v === "string"
+      ? v
+          .normalize("NFC")
+          .replace(INVISIBLE, (_, flag: string | undefined) => flag ?? "")
+          .replace(STRAY_JOINER, "")
+          .replace(/\s+/gu, " ")
+          .trim()
+      : "";
+  if (name === "" || name.length > MAX_NAME_LENGTH) {
     throw new ActionError(`Names must be 1-${MAX_NAME_LENGTH} characters.`);
   }
-  return v.trim();
+  return name;
 }
 
 function apply(engine: AnthillEngine, voter: string, action: Action) {
@@ -385,13 +491,19 @@ function parseAction(body: unknown): Action {
   if (typeof body !== "object" || body === null) {
     throw new ActionError("expected a JSON body");
   }
-  const { fn, args = {} } = body as { fn?: unknown; args?: Record<string, unknown> };
+  const { fn, args: rawArgs } = body as { fn?: unknown; args?: unknown };
+  // a default only replaces undefined: null (or a string) must not reach args[key]
+  if (rawArgs !== undefined && (typeof rawArgs !== "object" || rawArgs === null || Array.isArray(rawArgs))) {
+    throw new ActionError("args must be an object");
+  }
+  const args = (rawArgs ?? {}) as Record<string, unknown>;
 
   const id = (key: string) => {
     const v = args[key];
     if (typeof v !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(v)) {
       throw new ActionError(`${key} must be a 20-byte hex id`);
     }
+    if (SENTINELS.has(v.toLowerCase())) throw new ActionError("That person isn't in the tree.");
     return v.toLowerCase();
   };
   const name = () => parseName(args.name);

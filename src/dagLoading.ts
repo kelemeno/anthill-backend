@@ -35,8 +35,11 @@ export function resetIntermediate(dag: GraphData) {
   dag.dict[address1] = node1;
 }
 
+// Throttles reads against a chain node. Without a timeout (the off-chain
+// engine, rebuilt after every action) there's nothing to wait for: even a 0 ms
+// timer costs about 1 ms per read.
 function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : undefined;
 }
 
 export async function getSentDagVotes(
@@ -115,7 +118,8 @@ export async function getSaveChildren(
   id: string,
   timeout: number,
 ) {
-  console.log("Getting voter with address: " + id);
+  // progress for the slow chain crawl only (the engine has no timeout)
+  if (timeout > 0) console.log("Getting voter with address: " + id);
   var childCount = await AnthillContract.read.recTreeVoteCount([addr(id)]);
   for (var i = 0n; i < childCount; i++) {
     var childId = await AnthillContract.read.recTreeVote([addr(id), i]);
@@ -179,12 +183,12 @@ export async function loadAnthillGraph(
 
   dag.maxRelRootDepth = Number(await AnthillContract.read.MAX_REL_ROOT_DEPTH());
 
-  console.log("MaxRelRootDepth is: " + dag.maxRelRootDepth);
+  if (!testing) console.log("MaxRelRootDepth is: " + dag.maxRelRootDepth);
   anthillGraphNum += 1;
 
   var id: string = await AnthillContract.read.root();
   dag.rootId = id;
-  console.log("Root is: " + id);
+  if (!testing) console.log("Root is: " + id);
   var onChainRep = await AnthillContract.read.calculatedReputationForEpoch([
     addr(id),
   ]);
