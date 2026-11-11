@@ -26,6 +26,7 @@ import {
 } from "./store";
 
 export const MAX_NAME_LENGTH = 40;
+const CLOSED = "This community isn't taking new members.";
 const MAX_WEIGHT = 100n;
 const INVITE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_OPEN_INVITES = 10;
@@ -121,6 +122,7 @@ export class OffchainTree {
   //// invites
 
   createInvite(by: string): Invite {
+    if (this.info.joinPolicy === "closed") throw new ActionError(CLOSED);
     if (!this.engine.isInTree(by)) {
       throw new ActionError("Join the tree first, then you can invite people.");
     }
@@ -161,6 +163,8 @@ export class OffchainTree {
     if (invite.usedBy !== undefined) {
       throw new ActionError("This invite has already been used.");
     }
+    // a closed community takes nobody new, except through an admin's invite
+    if (this.info.joinPolicy === "closed" && invite.by !== "admin") throw new ActionError(CLOSED);
     if (invite.expires < new Date().toISOString()) {
       throw new ActionError("This invite has expired. Ask for a new one.");
     }
@@ -198,6 +202,9 @@ export class OffchainTree {
     }
     if (action.fn !== "joinTree") return action;
     const { invite } = action.args;
+    if (joinPolicy === "closed" && (invite === undefined || this.store.invite(invite)?.by !== "admin")) {
+      throw new ActionError(CLOSED);
+    }
     if (invite === undefined) {
       if (joinPolicy === "invite") {
         throw new ActionError("Joining needs an invite from someone in the community.");
@@ -333,15 +340,15 @@ function parseSettings(body: unknown): CommunitySettings {
   if (visibility !== "public" && visibility !== "private") {
     throw new ActionError("Choose whether the community is public or private.");
   }
-  if (joinPolicy !== "open" && joinPolicy !== "invite") {
-    throw new ActionError("Choose whether anyone can join or only people with an invite.");
+  if (joinPolicy !== "open" && joinPolicy !== "invite" && joinPolicy !== "closed") {
+    throw new ActionError("Choose who can join: anyone, people with an invite, or nobody for now.");
   }
   return {
     name: name.trim(),
     description: description.trim(),
     visibility,
     // nobody outside a private community can see where to join
-    joinPolicy: visibility === "private" ? "invite" : joinPolicy,
+    joinPolicy: visibility === "private" && joinPolicy === "open" ? "invite" : joinPolicy,
   };
 }
 

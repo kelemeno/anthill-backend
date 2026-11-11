@@ -30,8 +30,9 @@ export type CommunityInfo = {
   description: string;
   // private: only members can see it
   visibility: "public" | "private";
-  // open: anyone signed in can join at a free spot; invite: invite link only
-  joinPolicy: "open" | "invite";
+  // open: anyone signed in can join at a free spot; invite: invite link only;
+  // closed: nobody new (e.g. the demo)
+  joinPolicy: "open" | "invite" | "closed";
   createdBy: string;
   createdAt: string;
 };

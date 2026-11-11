@@ -107,6 +107,7 @@ async function main() {
   // The demo (the seeded tree) is invite only: join under a leaf with an
   // admin invite.
   const leaf = (await call(`${D}graph`)).data.randomLeaf as string;
+  assert.equal((await call("c/demo")).data.community.joinPolicy, "closed");
   const uninvited = await call(
     `${D}action`,
     { fn: "joinTree", args: { name: "Smoke", recipient: leaf } },
@@ -198,8 +199,11 @@ async function main() {
   console.log("ok: dry-run reasons");
 
   // Invites: a second person joins under the inviter.
-  const invite = await call(`${D}invites`, {}, session.token);
-  assert.equal(invite.status, 200, JSON.stringify(invite.data));
+  // The demo is closed: members can't invite, only an admin can.
+  const memberInvite = await call(`${D}invites`, {}, session.token);
+  assert.equal(memberInvite.status, 400);
+  assert.match(memberInvite.data.error, /isn't taking new members/);
+  const invite = { data: { code: await adminInvite("demo", session.user.id) } };
   const inviteInfo = await call(`invites/${invite.data.code}`);
   assert.deepEqual(inviteInfo.data.inviter, { id: session.user.id, name: "Smoke 2" });
   const friendKey = new SoftPasskey();

@@ -50,6 +50,47 @@ const COMMONS_FOUNDER = process.env.COMMONS_FOUNDER || "0xa0d64a92e36a7c122b28bd
 // marks that the demo's story (demoStory.ts) has been played
 const DEMO_STORY = "demo-story-1";
 
+// One-time fixes to the live data, run in order on startup after the demo's
+// story (each is marked in the log and never runs twice). They get the loaded
+// trees (a scratch copy; their actions go to the log and the load replays them).
+const FIXES: { id: string; run: (communities: Communities, store: Store) => void }[] = [
+  {
+    // The demo is for looking around: nobody joins it (not even by invite).
+    id: "close-demo",
+    run: (_communities, store) => {
+      const demo = store.community(DEMO.id);
+      if (demo === undefined) return;
+      const { name, description, visibility } = demo;
+      store.updateCommunity(DEMO.id, { name, description, visibility, joinPolicy: "closed" });
+    },
+  },
+  {
+    // Benedek joined the demo by mistake (through an invite from it): move him
+    // to the commons, under its root.
+    id: "benedek-to-commons",
+    run: (communities, store) => {
+      const who = "0xc689334412b0666069b309dfd658f56b95dbaf5d";
+      const demo = communities.get(DEMO.id);
+      const commons = communities.get(DEFAULT_COMMUNITY);
+      if (demo === undefined || commons === undefined) return;
+      if (demo.engine.isInTree(who)) demo.execute(who, { fn: "leaveTree" });
+      const root = commons.engine.root();
+      if (commons.engine.isInTree(who) || !commons.engine.isInTree(root)) return;
+      // the first free spot from the top
+      const queue = [root];
+      while (queue.length > 0) {
+        const at = queue.shift()!;
+        if (commons.engine.children(at).length < 2) {
+          const name = store.user(who)?.name || "Benedek";
+          commons.execute(who, { fn: "joinTree", args: { name, recipient: at } });
+          return;
+        }
+        queue.push(...commons.engine.children(at));
+      }
+    },
+  },
+];
+
 // What's served for one community, rebuilt after every action.
 class TreeView {
   graph: GraphData = { rootId: address0, maxRelRootDepth: 6, dict: {} };
@@ -369,7 +410,7 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
       rootId: view.graph.rootId,
       maxRelRootDepth: view.graph.maxRelRootDepth,
       randomLeaf: view.randomLeaf,
-      config: { inviteOnly: tree.info.joinPolicy === "invite" },
+      config: { inviteOnly: tree.info.joinPolicy !== "open" },
       community: summary(tree, viewer),
       nodes,
     });
@@ -504,6 +545,20 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
           (id) => store.user(id) !== undefined,
         );
         console.log("Played the demo's story:", played, "actions");
+      }
+      const pending = FIXES.filter((fix) => !store.hasMigration(fix.id));
+      if (pending.length > 0) {
+        const scratch = new Communities(store);
+        await scratch.load(async () => {});
+        for (const fix of pending) {
+          store.markMigration(fix.id);
+          try {
+            fix.run(scratch, store);
+            console.log("Applied fix", fix.id);
+          } catch (e) {
+            console.error("Fix failed", fix.id, e);
+          }
+        }
       }
       await communities.load(record);
       for (const tree of communities.all()) await viewOf(tree).rebuild(tree.engine);
