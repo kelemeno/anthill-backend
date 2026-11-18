@@ -10,7 +10,8 @@
 // in it, and probing is rate limited); pick an unguessable address if even
 // that matters.
 //
-// Communities with an agent commons (COMMONS_SITES) also have pairing
+// Communities with an agent commons (COMMONS_SITES, or one this backend runs
+// itself: commonsEmbed.ts, proxied at /commons/<id>/) also have pairing
 // routes for members' agents, their agents' list and revoke, and the agent
 // instructions page (see commonsAgents.ts); others answer 404 there.
 //
@@ -48,6 +49,7 @@ import {
   renderAgentMd,
   SETTLE_MS,
 } from "./commonsAgents";
+import { type Embed, mountCommonsProxy } from "./commonsEmbed";
 import { CommonsSigner, isCommonsPublicKey, verifyPairProof } from "./commonsLink";
 import { address0, address1, type GraphData } from "./dagBase";
 import { type History, type HistoryNode, type HistoryStep, snapshotNodes } from "./dagHistory";
@@ -332,11 +334,12 @@ const LEGACY_PATHS = new Set([
 // Registers the routes (they must exist before the first request) and returns
 // start(), which rebuilds everything from the log. `options.google` replaces
 // Google's endpoints and config, and `options.fetch` the requests to commons
-// coordinators (for the checks).
+// coordinators (for the checks). `options.embed`: the coordinators this
+// backend runs (commonsEmbed.ts; App.ts starts them once start() is done).
 export function offchainServer(
   app: Hono,
   broadcast: (message: string) => void,
-  options: { google?: GoogleOptions; fetch?: typeof fetch } = {},
+  options: { google?: GoogleOptions; fetch?: typeof fetch; embed?: Embed } = {},
 ) {
   const dataDir = process.env.DATA_DIR || join(process.cwd(), "data");
   const snapshotPath = join(process.cwd(), "anthillSnapshot.json");
@@ -379,6 +382,13 @@ export function offchainServer(
   const commonsSigner = new CommonsSigner(dataDir);
   // read now: a mistake in either stops the server here, not on a request
   const commonsSites = parseCommonsSites(process.env.COMMONS_SITES);
+  // the ones this backend runs (COMMONS_SITES wins for a community it names):
+  // agents and the website get the public URLs, the relay calls the child
+  for (const e of options.embed?.communities ?? []) {
+    if (commonsSites.has(e.community)) continue;
+    commonsSites.set(e.community, { coordinator: e.publicUrl, site: `${e.publicUrl}/`, repo: e.target, internal: e.internalUrl });
+  }
+  if (options.embed !== undefined) mountCommonsProxy(app, options.embed.communities, clientIp);
   const commonsKit = kitCommit();
   const pairings = new Pairings();
   const relay = new CommonsRelay(options.fetch);
@@ -1478,9 +1488,9 @@ export function offchainServer(
       // session (agent.md, the signed tree): it must be public
       for (const id of commonsSites.keys()) {
         const tree = communities.get(id);
-        if (tree === undefined) console.warn(`COMMONS_SITES: no community ${id}: its commons does nothing`);
+        if (tree === undefined) console.warn(`Agent commons: no community ${id}: its commons does nothing`);
         else if (tree.info.visibility !== "public") {
-          console.warn(`COMMONS_SITES: community ${id} is private: its agents can't read agent.md and its coordinator can't pin its tree, and Anthill refuses to pair agents there`);
+          console.warn(`Agent commons: community ${id} is private: its agents can't read agent.md and its coordinator can't pin its tree, and Anthill refuses to pair agents there`);
         }
       }
       ready = true;

@@ -32,6 +32,8 @@ import {
   findRandomLeaf,
 } from "./dagProcessing";
 import { buildHistory, type History } from "./dagHistory";
+import { parseCommonsSites } from "./commonsAgents";
+import { embedActive, exceptProxied, readEmbed, startEmbedded } from "./commonsEmbed";
 import { corsPolicy, securityHeaders } from "./headers";
 import { NotFoundError, RateLimitError, RelayError, clientIp, rateLimit } from "./http";
 import {
@@ -110,6 +112,17 @@ const captureSnapshot = process.env.CAPTURE_SNAPSHOT === "true";
 const chainMode = process.env.CHAIN_MODE === "true" || captureSnapshot;
 const offchainMode = !snapshotMode && !chainMode;
 const snapshotPath = join(process.cwd(), "anthillSnapshot.json");
+
+// Agent commons coordinators this backend runs as child processes, proxied
+// at /commons/<community>/ (see commonsEmbed.ts): on Render or with
+// COMMONS_EMBED=true, off chain only. A mistake in commons.config.json stops
+// the server here; nothing a child does can.
+const embedRead = offchainMode
+  ? readEmbed({ port: Number(port), sites: new Set(parseCommonsSites(process.env.COMMONS_SITES).keys()) })
+  : { embed: null, notes: embedActive() ? ["off: only the off-chain backend runs coordinators"] : [] };
+for (const note of embedRead.notes) console.log("Agent commons:", note);
+const embed = embedRead.embed ?? undefined;
+const embedded = embed?.communities ?? [];
 
 //////////////////////////////
 ////// serve
@@ -192,13 +205,17 @@ app.onError((err, c) => {
 });
 
 // Every body is small JSON (a passkey response is a few KB): anything bigger
-// is refused before it's read.
+// is refused before it's read. Not the commons' (patches are bigger): the
+// proxy streams them, and the coordinator holds each route to its own limit.
 app.use(
   "*",
-  bodyLimit({
-    maxSize: 64 * 1024,
-    onError: (c) => c.json({ error: "Request body too large." }, 413),
-  }),
+  exceptProxied(
+    embedded,
+    bodyLimit({
+      maxSize: 64 * 1024,
+      onError: (c) => c.json({ error: "Request body too large." }, 413),
+    }),
+  ),
 );
 
 // The passkey ceremonies, per IP: room for a meetup on one Wi-Fi signing up
@@ -207,14 +224,19 @@ app.use("/auth/*", async (c, next) => {
   if (c.req.method !== "GET") rateLimit(`auth:${clientIp(c)}`, 60);
   await next();
 });
-app.use("*", async (c, next) => {
-  if (c.req.method === "POST") rateLimit(`post:${clientIp(c)}`, 240);
-  await next();
-});
+// (the commons' coordinator limits its own clients, by the address the proxy
+// passes on)
+app.use(
+  "*",
+  exceptProxied(embedded, async (c, next) => {
+    if (c.req.method === "POST") rateLimit(`post:${clientIp(c)}`, 240);
+    await next();
+  }),
+);
 
 // Off chain the tree, accounts and communities are served by offchainApi.ts;
 // on chain and from the snapshot, the read-only routes below.
-const offchain = offchainMode ? offchainServer(app, broadcast) : undefined;
+const offchain = offchainMode ? offchainServer(app, broadcast, { embed }) : undefined;
 if (!offchainMode) legacyRoutes();
 
 // Full evolution of the graph as per-event snapshots, built by replaying all
@@ -317,7 +339,10 @@ const server = serve(
     if (snapshotMode) {
       loadSnapshot();
     } else if (offchain !== undefined) {
-      offchain.start();
+      // the coordinators once the log has loaded: their setup asks for the tree
+      offchain.start().then(() => {
+        if (embed !== undefined) startEmbedded(embed);
+      });
     } else {
       crawlEthereum(testing);
     }

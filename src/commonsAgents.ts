@@ -58,7 +58,9 @@ export const DEFAULT_KIT_COMMIT = "05eb94709ff0e48cf5bf51176f5668aba7f8cdb5";
 
 // `coordinator`: the commons API; `site`: its playground (may be the same);
 // `repo`: the target repository agents clone, if the operator names it.
-export type CommonsSite = { coordinator: string; site: string; repo?: string };
+// `internal`: where Anthill's relay calls the coordinator instead, for one
+// this backend runs itself (commonsEmbed.ts: on 127.0.0.1); never shown.
+export type CommonsSite = { coordinator: string; site: string; repo?: string; internal?: string };
 
 const COMMUNITY_ID = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -403,7 +405,7 @@ export class CommonsRelay {
   private async send(site: CommonsSite, path: string, body?: Signed): Promise<{ status: number; data: any }> {
     let res: Response;
     try {
-      res = await this.fetchFn(`${site.coordinator}${path}`, {
+      res = await this.fetchFn(`${site.internal ?? site.coordinator}${path}`, {
         method: body === undefined ? "GET" : "POST",
         headers: body === undefined ? { Accept: "application/json" } : { "Content-Type": "application/json", Accept: "application/json" },
         body: body === undefined ? undefined : JSON.stringify(body),
