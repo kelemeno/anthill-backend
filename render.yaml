@@ -27,6 +27,14 @@ services:
       # generates the value, copy it from the dashboard when you need it
       - key: ADMIN_TOKEN
         generateValue: true
+      # Google sign-in (see src/google.ts): an OAuth client of type "Web
+      # application" in Google Cloud, with https://anthilldao.dev/auth/google
+      # as an authorised redirect URI. Set both in the dashboard; without them
+      # Google sign-in is off and the site only offers passkeys.
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
       # set to "true" once real members can invite everyone else
       - key: INVITE_ONLY
         value: "false"

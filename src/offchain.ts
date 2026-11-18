@@ -242,9 +242,11 @@ export class OffchainTree {
     }
     if (action.fn === "joinTreeAsRoot") {
       // Only possible in an empty tree (the engine checks that). Starting it
-      // is up to the founder; without one (a fresh data dir's commons) anyone
+      // is up to the founder; without one (a fresh data dir's commons, or a
+      // community whose founder deleted their account) anyone who can see it
       // can, unless it's closed: the join policy is about joining a tree
-      // someone started, and an invite needs someone in it to give one.
+      // someone started, and an invite needs someone in it to give one. An
+      // empty private one is seen by nobody, so nobody can start it again.
       if (createdBy !== "" ? by !== createdBy : joinPolicy === "closed") {
         throw new ActionError("Only the founder can start this community's tree.");
       }
@@ -378,9 +380,17 @@ export class Communities {
 
   // Change a community's name, description, visibility or join policy.
   // Returns whether anything changed (unchanged settings aren't logged).
+  // The founder decides; a community without one (its founder deleted their
+  // account, or a fresh data dir's commons) is looked after by its tree's
+  // root, who also closes its polls (see Polls' steward). An empty
+  // founderless tree has no root, so nobody can until someone starts it.
   updateSettings(by: string, tree: OffchainTree, body: unknown): boolean {
-    if (by !== tree.info.createdBy) {
-      throw new ActionError("Only the founder can change the community's settings.");
+    if (by !== (tree.info.createdBy || tree.engine.root())) {
+      throw new ActionError(
+        tree.info.createdBy === ""
+          ? "Only the root of the tree can change the settings of a community without a founder."
+          : "Only the founder can change the community's settings.",
+      );
     }
     const settings = parseSettings(body);
     const info = tree.info;
@@ -447,18 +457,23 @@ const INVISIBLE =
 const STRAY_JOINER =
   /(?<![\p{Extended_Pictographic}\p{Emoji_Modifier}\uFE0F\p{sc=Arab}\p{sc=Syrc}\p{sc=Nkoo}\p{sc=Mong}\p{sc=Deva}\p{sc=Beng}\p{sc=Guru}\p{sc=Gujr}\p{sc=Orya}\p{sc=Taml}\p{sc=Telu}\p{sc=Knda}\p{sc=Mlym}\p{sc=Sinh}])[\u200C\u200D]|[\u200C\u200D](?=[\s\u200C\u200D]|$)/gu;
 
-// An account or node name as it's stored: invisible characters taken out,
-// runs of spaces made one, trimmed, 1-40 characters.
+// A name as it shows: invisible characters taken out, runs of spaces made
+// one, trimmed. Never throws, so it also cleans names stored before names
+// were cleaned this way (the log keeps them as they were), to compare a name
+// someone typed with one they see.
+export function cleanName(v: string): string {
+  return v
+    .normalize("NFC")
+    .replace(INVISIBLE, (_, flag: string | undefined) => flag ?? "")
+    .replace(STRAY_JOINER, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+// An account or node name as it's stored: cleaned (see cleanName), 1-40
+// characters.
 export function parseName(v: unknown): string {
-  const name =
-    typeof v === "string"
-      ? v
-          .normalize("NFC")
-          .replace(INVISIBLE, (_, flag: string | undefined) => flag ?? "")
-          .replace(STRAY_JOINER, "")
-          .replace(/\s+/gu, " ")
-          .trim()
-      : "";
+  const name = typeof v === "string" ? cleanName(v) : "";
   if (name === "" || name.length > MAX_NAME_LENGTH) {
     throw new ActionError(`Names must be 1-${MAX_NAME_LENGTH} characters.`);
   }

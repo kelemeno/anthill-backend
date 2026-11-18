@@ -5,7 +5,6 @@ import { serve } from "@hono/node-server";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
-import { cors } from "hono/cors";
 import type { WSContext } from "hono/ws";
 import type { Address, Log } from "viem";
 import {
@@ -14,7 +13,7 @@ import {
   makeAnthillContract,
   makePublicClient,
 } from "./anthillContract";
-import { AuthError } from "./auth";
+import { AuthError, origins } from "./auth";
 import {
   addDagVote,
   address0,
@@ -33,6 +32,7 @@ import {
   findRandomLeaf,
 } from "./dagProcessing";
 import { buildHistory, type History } from "./dagHistory";
+import { corsPolicy, securityHeaders } from "./headers";
 import { NotFoundError, RateLimitError, clientIp, rateLimit } from "./http";
 import {
   NodeDataBareCollapse,
@@ -114,20 +114,11 @@ const snapshotPath = join(process.cwd(), "anthillSnapshot.json");
 //////////////////////////////
 ////// serve
 
-// permissive CORS (Access-Control-Allow-Origin: *)
-app.use(
-  "*",
-  cors({
-    origin: "*",
-    allowHeaders: [
-      "Origin",
-      "X-Requested-With",
-      "Content-Type",
-      "Accept",
-      "Authorization",
-    ],
-  }),
-);
+// Security headers and no caching of account answers on everything; CORS
+// for the frontend's origins, and public reads for any other site (see
+// headers.ts).
+app.use("*", securityHeaders());
+app.use("*", corsPolicy(origins));
 
 // WebSocket endpoint. Accepts connections and broadcasts "update" (or, off
 // chain, "update:<community>") to all clients on graph changes.

@@ -9,20 +9,47 @@
 // later moved to a demo community (a "commonsMoved" entry), leaving the
 // commons empty for real members. Entries are always tagged now. Accounts and
 // profiles are shared by all communities.
+//
+// Accounts sign in with passkeys or Google (see auth.ts and google.ts). Each
+// sign-in is logged as a session (no IP address, only a coarse device label),
+// so people can see their sessions and end one; the log also records an
+// account's deletion, after which it can never sign in again and its id is
+// never reused: nothing new is written for it (or by it) from then on, so a
+// request that was signed in just before can't bring it back. Entry types
+// are only ever added: the production log has to replay unchanged.
+//
+// The one thing about an account kept outside the log is its Google email,
+// in <DATA_DIR>/google-emails.json, so that unlinking Google, recovering
+// (which unlinks it) or deleting the account really erases it: the log can
+// never forget. The log has only Google's id for the account (`sub`). The
+// file isn't part of replay: without it (or without an account in it) that
+// account shows as "a Google account" until its next Google sign-in.
 
 import {
   appendFileSync,
+  closeSync,
+  createReadStream,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  renameSync,
+  rmSync,
   statSync,
   truncateSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
+import { AuthError } from "./auth";
 import type { SeedGraph } from "./engine";
 
 export type StoredUser = { id: string; name: string };
+
+// What a deleted account is called from then on (in polls it created, say).
+export const DELETED_NAME = "Deleted account";
 
 export const DEFAULT_COMMUNITY = "commons";
 
@@ -79,6 +106,31 @@ export type StoredPasskey = {
   publicKey: string; // base64url
   counter: number;
   transports?: string[];
+};
+
+// The Google account an Anthill account signs in with, as logged: Google's
+// id for the person (`sub`, which never changes). Never the email (see the
+// top).
+export type GoogleLink = { sub: string };
+
+// The Google account with the email Google last reported for it, which only
+// the account holder sees. No email when the side file doesn't have it.
+export type LinkedGoogle = GoogleLink & { email?: string };
+
+// How a session was made: signing in with a passkey or Google, signing up
+// with a passkey, or recovering with the recovery code.
+export type SessionMethod = "passkey" | "google" | "register" | "recovery";
+
+export type StoredSession = {
+  sid: string;
+  userId: string;
+  method: SessionMethod;
+  // e.g. "Chrome on macOS", from the User-Agent
+  device: string;
+  at: string;
+  expires: string;
+  // the credential id, for sessions made with a passkey
+  passkey?: string;
 };
 
 export type Action =
@@ -143,7 +195,7 @@ type Entry =
   // ends every session of the user (bumps its session version)
   | { type: "signOutAll"; at: string; userId: string }
   // a completed recovery: the new passkey replaces the user's others, the code
-  // is replaced and every session ends, all at once
+  // is replaced, every session ends and Google is unlinked, all at once
   | { type: "recovered"; at: string; userId: string; passkey: StoredPasskey; hash: string }
   | { type: "name"; at: string; userId: string; name: string }
   | { type: "invite"; at: string; invite: Invite }
@@ -159,7 +211,22 @@ type Entry =
     }
   | { type: "pollVote"; at: string; pollId: string; by: string; option: number }
   | { type: "pollClose"; at: string; pollId: string; tally: string[]; voters?: number[] }
+  // a sign-in: its token carries the sid and is refused once the session ends
+  | ({ type: "session" } & StoredSession)
+  | { type: "sessionEnd"; at: string; userId: string; sid: string }
+  | { type: "passkeyRemoved"; at: string; userId: string; id: string }
+  // an account made by signing in with Google (it has no passkey yet)
+  | { type: "googleAccount"; at: string; user: StoredUser; google: GoogleLink }
+  // linked to an existing account (a new email for the same Google account
+  // isn't logged: it only goes to the side file)
+  | { type: "googleLinked"; at: string; userId: string; google: GoogleLink }
+  | { type: "googleUnlinked"; at: string; userId: string }
+  // the account is gone: no way to sign in, no profile, renamed, and the
+  // communities it founded have no founder (it left their trees before this)
+  | { type: "accountDeleted"; at: string; userId: string }
   | ActionEntry;
+
+export type LogEntry = Entry;
 
 export class Store {
   readonly logPath: string;
@@ -168,6 +235,18 @@ export class Store {
   private passkeys = new Map<string, StoredPasskey>();
   private recoveryHashes = new Map<string, string>(); // userId -> hash
   private sessionVersions = new Map<string, number>(); // userId -> version, default 0
+  // userId -> sid -> its session, for the ones that haven't ended (expired
+  // ones are dropped as the user signs in again)
+  private sessions = new Map<string, Map<string, StoredSession>>();
+  private passkeyAddedAt = new Map<string, string>(); // credential id -> when
+  private passkeyUsedAt = new Map<string, string>(); // credential id -> newest session with it
+  private googleOfUser = new Map<string, GoogleLink>(); // userId -> its Google account
+  private userOfGoogle = new Map<string, string>(); // Google sub -> userId
+  // userId -> its Google account and email, as in the side file (see the
+  // top): only for accounts linked to that same Google account now
+  private googleEmails = new Map<string, { sub: string; email: string }>();
+  private googleEmailsPath: string;
+  private deletedUsers = new Set<string>();
   private invites = new Map<string, Invite>();
   private profiles = new Map<string, Profile>();
   private pollsById = new Map<string, Poll>();
@@ -188,10 +267,12 @@ export class Store {
     mkdirSync(dir, { recursive: true });
     this.logPath = join(dir, "log.jsonl");
     this.secretPath = join(dir, "session-secret");
+    this.googleEmailsPath = join(dir, "google-emails.json");
+    if (existsSync(this.logPath)) this.replay();
+    this.loadGoogleEmails();
+  }
 
-    if (!existsSync(this.logPath)) {
-      return;
-    }
+  private replay() {
     const raw = readFileSync(this.logPath);
     const lines = raw.toString("utf8").split("\n");
     let lastLine = lines.length - 1;
@@ -337,8 +418,10 @@ export class Store {
     return this.recoveryHashes.get(userId);
   }
 
+  // Also unlinks Google (see apply), so its email goes too.
   recover(userId: string, passkey: StoredPasskey, hash: string) {
     this.append({ type: "recovered", at: now(), userId, passkey, hash });
+    this.forgetGoogleEmail(userId);
   }
 
   // Session tokens carry this; a token with an older one is refused.
@@ -354,6 +437,102 @@ export class Store {
   // old entries may carry another name; new ones always carry this one.
   setUserName(userId: string, name: string) {
     this.append({ type: "name", at: now(), userId, name });
+  }
+
+  ////////////////////////////////////////////
+  //// sessions
+
+  startSession(session: Omit<StoredSession, "at">) {
+    this.append({ type: "session", at: now(), ...session });
+  }
+
+  endSession(userId: string, sid: string) {
+    this.append({ type: "sessionEnd", at: now(), userId, sid });
+  }
+
+  // The session, unless it ended (or never was).
+  session(userId: string, sid: string) {
+    return this.sessions.get(userId)?.get(sid);
+  }
+
+  // The user's sessions that are still open, newest first (in the log's
+  // order, which is the order they were made in).
+  sessionsOf(userId: string) {
+    const nowIso = now();
+    return [...(this.sessions.get(userId)?.values() ?? [])].reverse().filter((s) => s.expires > nowIso);
+  }
+
+  ////////////////////////////////////////////
+  //// more about passkeys, Google, deletion
+
+  removePasskey(userId: string, id: string) {
+    this.append({ type: "passkeyRemoved", at: now(), userId, id });
+  }
+
+  // When the passkey was added, and when it last made a session (undefined
+  // for sign-ins from before sessions were logged).
+  passkeyDates(id: string) {
+    return { addedAt: this.passkeyAddedAt.get(id), usedAt: this.passkeyUsedAt.get(id) };
+  }
+
+  // The log gets the sub, the side file the email (see the top).
+  addGoogleUser(user: StoredUser, google: { sub: string; email: string }) {
+    this.append({ type: "googleAccount", at: now(), user, google: { sub: google.sub } });
+    this.setGoogleEmail(user.id, google.sub, google.email);
+  }
+
+  linkGoogle(userId: string, google: { sub: string; email: string }) {
+    this.append({ type: "googleLinked", at: now(), userId, google: { sub: google.sub } });
+    this.setGoogleEmail(userId, google.sub, google.email);
+  }
+
+  // The email Google reports now for the account's linked Google account
+  // (on each sign-in with it): only the side file changes.
+  googleEmailSeen(userId: string, email: string) {
+    const google = this.googleOfUser.get(userId);
+    if (google !== undefined) this.setGoogleEmail(userId, google.sub, email);
+  }
+
+  unlinkGoogle(userId: string) {
+    this.append({ type: "googleUnlinked", at: now(), userId });
+    this.forgetGoogleEmail(userId);
+  }
+
+  googleOf(userId: string): LinkedGoogle | undefined {
+    const google = this.googleOfUser.get(userId);
+    if (google === undefined) return undefined;
+    const email = this.googleEmails.get(userId);
+    return email?.sub === google.sub ? { sub: google.sub, email: email.email } : { sub: google.sub };
+  }
+
+  userByGoogleSub(sub: string) {
+    const userId = this.userOfGoogle.get(sub);
+    return userId === undefined ? undefined : this.users.get(userId);
+  }
+
+  deleteAccount(userId: string) {
+    this.append({ type: "accountDeleted", at: now(), userId });
+    this.forgetGoogleEmail(userId);
+  }
+
+  isDeleted(userId: string) {
+    return this.deletedUsers.has(userId);
+  }
+
+  // Every entry in the log, oldest first, read a line at a time (for an
+  // account's export: the log can be big, and this doesn't hold it all or
+  // block other requests). A line being written meanwhile is skipped.
+  async *entries(): AsyncGenerator<LogEntry> {
+    if (!existsSync(this.logPath)) return;
+    const lines = createInterface({ input: createReadStream(this.logPath), crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (line.trim() === "") continue;
+      try {
+        yield JSON.parse(line, bigintReviver) as LogEntry;
+      } catch {
+        // the end of the log, cut short by a write in progress
+      }
+    }
   }
 
   userByRecoveryHash(hash: string) {
@@ -435,7 +614,10 @@ export class Store {
   }
 
   // Written before it's applied, so memory never holds what the log doesn't.
+  // Nothing is written by or about a deleted account (see the top): such a
+  // write comes from a request that was signed in before the deletion.
   private append(entry: Entry) {
+    if (accountsOf(entry).some((id) => this.deletedUsers.has(id))) throw new AuthError("session expired");
     const line = `${JSON.stringify(entry, bigintReplacer)}\n`;
     const sizeBefore = existsSync(this.logPath) ? statSync(this.logPath).size : 0;
     try {
@@ -459,6 +641,86 @@ export class Store {
     }
     this.needsNewline = false;
     this.apply(entry);
+  }
+
+  ////////////////////////////////////////////
+  //// the Google emails' side file (see the top)
+
+  // Keeps only the emails of accounts linked to that same Google account
+  // now: one left behind by a write that failed after an unlink, recovery or
+  // deletion goes here, at the latest. An unreadable file counts as empty.
+  private loadGoogleEmails() {
+    let saved: unknown = {};
+    let dropped = false;
+    if (existsSync(this.googleEmailsPath)) {
+      try {
+        saved = JSON.parse(readFileSync(this.googleEmailsPath, "utf8"));
+      } catch (e) {
+        console.error(
+          `WARNING: ${this.googleEmailsPath} couldn't be read (${e}); Google accounts show without their email until their next sign-in.`,
+        );
+        dropped = true;
+      }
+    }
+    if (typeof saved !== "object" || saved === null || Array.isArray(saved)) {
+      saved = {};
+      dropped = true;
+    }
+    for (const [userId, value] of Object.entries(saved as object)) {
+      const { sub, email } = (value ?? {}) as { sub?: unknown; email?: unknown };
+      // not linked now, or to another Google account: stale
+      const stale = typeof sub !== "string" || this.googleOfUser.get(userId)?.sub !== sub;
+      if (stale || typeof email !== "string" || email === "") {
+        dropped = true;
+        continue;
+      }
+      this.googleEmails.set(userId, { sub, email });
+    }
+    if (dropped) this.saveGoogleEmails();
+  }
+
+  private setGoogleEmail(userId: string, sub: string, email: string) {
+    const before = this.googleEmails.get(userId);
+    if (before?.sub === sub && before.email === email) return;
+    // Google may give no email: then none is kept
+    if (email === "") this.googleEmails.delete(userId);
+    else this.googleEmails.set(userId, { sub, email });
+    this.saveGoogleEmails();
+  }
+
+  private forgetGoogleEmail(userId: string) {
+    if (this.googleEmails.delete(userId)) this.saveGoogleEmails();
+  }
+
+  // The whole file, written to a temporary one and renamed over it, so a
+  // crash leaves the old file or the new one, never half of one. It's only
+  // read by the owner (like the session secret). If the write fails, memory
+  // is still right; the next write, or the next start, puts the file right.
+  // That isn't worth failing the request for: its log entry is in already.
+  private saveGoogleEmails() {
+    const temp = `${this.googleEmailsPath}.tmp`;
+    try {
+      // a leftover from a crash could have other permissions
+      rmSync(temp, { force: true });
+      const fd = openSync(temp, "w", 0o600);
+      try {
+        writeSync(fd, `${JSON.stringify(Object.fromEntries(this.googleEmails))}\n`);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temp, this.googleEmailsPath);
+    } catch (e) {
+      console.error(
+        `WARNING: couldn't write ${this.googleEmailsPath} (${e}); it's put right by the next write or start.`,
+      );
+    }
+  }
+
+  private unlinkGoogleOf(userId: string) {
+    const google = this.googleOfUser.get(userId);
+    if (google !== undefined && this.userOfGoogle.get(google.sub) === userId) this.userOfGoogle.delete(google.sub);
+    this.googleOfUser.delete(userId);
   }
 
   private apply(entry: Entry) {
@@ -489,9 +751,14 @@ export class Store {
       case "passkey":
         this.users.set(entry.user.id, { ...entry.user });
         this.passkeys.set(entry.passkey.id, { ...entry.passkey });
+        this.passkeyAddedAt.set(entry.passkey.id, entry.at);
         break;
       case "passkeyAdded":
         this.passkeys.set(entry.passkey.id, { ...entry.passkey });
+        this.passkeyAddedAt.set(entry.passkey.id, entry.at);
+        break;
+      case "passkeyRemoved":
+        if (this.passkeys.get(entry.id)?.userId === entry.userId) this.passkeys.delete(entry.id);
         break;
       case "counter": {
         const passkey = this.passkeys.get(entry.id);
@@ -503,13 +770,68 @@ export class Store {
         break;
       case "signOutAll":
         this.sessionVersions.set(entry.userId, this.sessionVersion(entry.userId) + 1);
+        this.sessions.delete(entry.userId);
         break;
       case "recovered":
+        // Everything someone with a lost device could have added goes: its
+        // passkeys, sessions and a Google account linked from it. (Logs from
+        // before Google have no link to remove, so they replay the same.)
         for (const p of this.passkeysOf(entry.userId)) this.passkeys.delete(p.id);
         this.passkeys.set(entry.passkey.id, { ...entry.passkey });
+        this.passkeyAddedAt.set(entry.passkey.id, entry.at);
         this.recoveryHashes.set(entry.userId, entry.hash);
         this.sessionVersions.set(entry.userId, this.sessionVersion(entry.userId) + 1);
+        this.sessions.delete(entry.userId);
+        this.unlinkGoogleOf(entry.userId);
         break;
+      case "session": {
+        const { type: _, ...session } = entry;
+        let open = this.sessions.get(entry.userId);
+        if (open === undefined) {
+          open = new Map();
+          this.sessions.set(entry.userId, open);
+        }
+        // the user's expired sessions go, so the map only holds live ones
+        for (const [sid, s] of open) if (s.expires < entry.at) open.delete(sid);
+        open.set(entry.sid, session);
+        if (entry.passkey !== undefined) this.passkeyUsedAt.set(entry.passkey, entry.at);
+        break;
+      }
+      case "sessionEnd":
+        this.sessions.get(entry.userId)?.delete(entry.sid);
+        break;
+      case "googleAccount":
+        this.users.set(entry.user.id, { ...entry.user });
+        // only the sub (entries from before the email left the log had it)
+        this.googleOfUser.set(entry.user.id, { sub: entry.google.sub });
+        this.userOfGoogle.set(entry.google.sub, entry.user.id);
+        break;
+      case "googleLinked": {
+        const before = this.googleOfUser.get(entry.userId);
+        if (before !== undefined) this.userOfGoogle.delete(before.sub);
+        this.googleOfUser.set(entry.userId, { sub: entry.google.sub });
+        this.userOfGoogle.set(entry.google.sub, entry.userId);
+        break;
+      }
+      case "googleUnlinked":
+        this.unlinkGoogleOf(entry.userId);
+        break;
+      case "accountDeleted": {
+        const { userId } = entry;
+        const user = this.users.get(userId);
+        if (user !== undefined) user.name = DELETED_NAME;
+        for (const p of this.passkeysOf(userId)) this.passkeys.delete(p.id);
+        this.unlinkGoogleOf(userId);
+        this.recoveryHashes.delete(userId);
+        this.profiles.delete(userId);
+        this.sessionVersions.set(userId, this.sessionVersion(userId) + 1);
+        this.sessions.delete(userId);
+        for (const [id, c] of this.communityById) {
+          if (c.createdBy === userId) this.communityById.set(id, { ...c, createdBy: "" });
+        }
+        this.deletedUsers.add(userId);
+        break;
+      }
       case "name": {
         const user = this.users.get(entry.userId);
         if (user !== undefined) user.name = entry.name;
@@ -565,7 +887,30 @@ export class Store {
 }
 
 function now() {
-  return new Date().toISOString();
+  return new Date(Date.now()).toISOString();
+}
+
+// The accounts an entry is by or about.
+function accountsOf(entry: Entry): string[] {
+  switch (entry.type) {
+    case "action":
+    case "poll":
+    case "pollVote":
+      return [entry.by];
+    case "community":
+      return [entry.community.createdBy];
+    case "invite":
+      return [entry.invite.by];
+    case "passkey":
+    case "googleAccount":
+      return [entry.user.id];
+    case "passkeyAdded":
+      return [entry.passkey.userId];
+    case "commonsMoved":
+      return [entry.commonsFounder];
+    default:
+      return "userId" in entry ? [entry.userId] : [];
+  }
 }
 
 // JSON (de)serialisation that survives bigints, same encoding as the snapshot.

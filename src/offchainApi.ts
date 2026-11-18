@@ -1,4 +1,4 @@
-// The off-chain server's routes: passkey sign-in, accounts, communities and,
+// The off-chain server's routes: sign-in (passkeys, Google), accounts, communities and,
 // inside each community (/c/<id>/...), its tree, actions, invites and polls.
 // The original unscoped paths (/graph, /action, ...) still answer for the
 // default community, so pages loaded before communities existed keep working.
@@ -22,10 +22,11 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { createGzip, gunzip } from "node:zlib";
 import type { Context, Hono } from "hono";
+import { accountExport, type Standing } from "./account";
 import type { AnthillContractType } from "./anthillContract";
-import { PasskeyAuth } from "./auth";
+import { AuthError, deviceLabel, PasskeyAuth } from "./auth";
 import { CommonsSigner, isCommonsPublicKey } from "./commonsLink";
-import { address0, type GraphData } from "./dagBase";
+import { address0, address1, type GraphData } from "./dagBase";
 import { type History, type HistoryNode, type HistoryStep, snapshotNodes } from "./dagHistory";
 import { loadAnthillGraph } from "./dagLoading";
 import {
@@ -35,9 +36,19 @@ import {
 } from "./dagProcessing";
 import type { AnthillEngine, EngineEvent, SeedGraph } from "./engine";
 import { playDemoStory } from "./demoStory";
-import { clientIp, jsonBody, NotFoundError, rateCount, rateLimit, rateRoom, requireAdmin } from "./http";
+import { type GoogleFlowAccount, type GoogleOptions, GoogleSignIn } from "./google";
+import {
+  clientIp,
+  jsonBody,
+  NotFoundError,
+  RateLimitError,
+  rateCount,
+  rateLimit,
+  rateRoom,
+  requireAdmin,
+} from "./http";
 import { NodeDataStoreCollapse, type NodeDataString } from "./nodeData";
-import { ActionError, Communities, type Executed, type OffchainTree, parseName } from "./offchain";
+import { ActionError, Communities, cleanName, type Executed, type OffchainTree, parseName } from "./offchain";
 import { Polls, setProfile } from "./social";
 import {
   type ActionEntry,
@@ -75,6 +86,15 @@ const SIGNUPS_PER_HOUR = 100;
 const ACTIONS_PER_DAY = 500;
 // marks that the demo's story (demoStory.ts) has been played
 const DEMO_STORY = "demo-story-1";
+// account exports per account and hour, and per client IP and hour (each
+// reads the whole log, and accounts cost nothing to make)
+const EXPORTS_PER_HOUR = 5;
+const EXPORTS_PER_IP_PER_HOUR = 10;
+// exports run one at a time; more than this many waiting or running are
+// refused, so the work they take is bounded however many accounts ask
+const MAX_PENDING_EXPORTS = 3;
+// account routes that need the trees loaded (the rest of /auth/ doesn't)
+const AUTH_NEEDS_TREES = new Set(["/auth/export", "/auth/delete"]);
 
 const BENEDEK = "0xc689334412b0666069b309dfd658f56b95dbaf5d";
 
@@ -285,8 +305,13 @@ const LEGACY_PATHS = new Set([
 ]);
 
 // Registers the routes (they must exist before the first request) and returns
-// start(), which rebuilds everything from the log.
-export function offchainServer(app: Hono, broadcast: (message: string) => void) {
+// start(), which rebuilds everything from the log. `options.google` replaces
+// Google's endpoints and config (for the checks).
+export function offchainServer(
+  app: Hono,
+  broadcast: (message: string) => void,
+  options: { google?: GoogleOptions } = {},
+) {
   const dataDir = process.env.DATA_DIR || join(process.cwd(), "data");
   const snapshotPath = join(process.cwd(), "anthillSnapshot.json");
   const readSnapshot = () =>
@@ -313,7 +338,8 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   // (and the WebSocket) waits.
   let ready = false;
   app.use("*", async (c, next) => {
-    if (!ready && c.req.path !== "/" && !c.req.path.startsWith("/auth/")) {
+    const path = c.req.path;
+    if (!ready && path !== "/" && (!path.startsWith("/auth/") || AUTH_NEEDS_TREES.has(path))) {
       c.header("Retry-After", "5");
       return c.json({ error: "Starting up, try again in a moment." }, 503);
     }
@@ -321,6 +347,9 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   });
 
   const auth = new PasskeyAuth(store);
+  // seals Google sign-in flows, and makes private communities' update keys
+  const keySecret = process.env.SESSION_SECRET || store.sessionSecret(() => randomBytes(32).toString("hex"));
+  const google = new GoogleSignIn(keySecret, options.google);
   const commonsSigner = new CommonsSigner(dataDir);
   const communities = new Communities(store);
   const views = new Map<string, TreeView>();
@@ -364,7 +393,6 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
 
   // What the WebSocket calls a community (see the top): private ones' ids
   // aren't broadcast. The key can't be an id ("_" isn't allowed in one).
-  const keySecret = process.env.SESSION_SECRET || store.sessionSecret(() => randomBytes(32).toString("hex"));
   function updateKeyOf(tree: OffchainTree) {
     if (tree.info.visibility === "public") return tree.id;
     return `p_${createHmac("sha256", keySecret).update(`update-key:${tree.id}`).digest("hex").slice(0, 24)}`;
@@ -401,6 +429,8 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
 
   const signedIn = (c: Context) => auth.userFromHeader(c.req.header("Authorization"));
   const freshUser = (c: Context) => auth.freshUserFromHeader(c.req.header("Authorization"));
+  // what a new session is labelled in the account's session list
+  const deviceOf = (c: Context) => deviceLabel(c.req.header("User-Agent"));
 
   // The body of a passkey ceremony's second step, checked before the flow is
   // used up, so a malformed one is a 400 and the flow can still be finished.
@@ -436,6 +466,7 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
 
   function summary(tree: OffchainTree, viewer?: string) {
     const { id, name, description, visibility, joinPolicy, createdBy, createdAt } = tree.info;
+    const steward = createdBy || tree.engine.root();
     const { dict, rootId } = viewOf(tree).graph;
     // as served: not whoever the root doesn't reach (see isMember)
     const members = tree.engine.members().filter((m) => tree.isMember(m));
@@ -451,6 +482,8 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
       members: members.length,
       rootName: dict[rootId]?.name ?? "",
       isFounder: viewer !== undefined && viewer === createdBy,
+      // the founder, or the tree's root when there's none (see updateSettings)
+      canChangeSettings: viewer !== undefined && viewer === steward,
       // the viewer's standing, when they're a member
       you:
         me === undefined
@@ -477,6 +510,9 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   ////////////////////////////////////////////
   //// passkey sign-in and accounts
 
+  // Which ways to sign in this server offers (Google only when configured).
+  app.get("/auth/methods", (c) => c.json({ passkey: true, google: google.enabled }));
+
   app.post("/auth/register/options", async (c) => {
     const { name } = await jsonBody(c);
     return c.json(await auth.registrationOptions(parseName(name)));
@@ -491,7 +527,7 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
     const { flowId, response } = await ceremony(c);
     const key = `signup:${clientIp(c)}`;
     rateRoom(key, SIGNUPS_PER_HOUR);
-    const created = await auth.verifyRegistration(flowId, response);
+    const created = await auth.verifyRegistration(flowId, response, deviceOf(c));
     rateCount(key, 60 * 60_000);
     return c.json(created);
   });
@@ -502,25 +538,39 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
 
   app.post("/auth/login/verify", async (c) => {
     const { flowId, response } = await ceremony(c);
-    return c.json(await auth.verifyAuthentication(flowId, response));
+    return c.json(await auth.verifyAuthentication(flowId, response, deviceOf(c)));
   });
 
+  // `methods` (how the account signs in) is for the account page.
   app.get("/auth/me", (c) => {
     const user = signedIn(c);
-    return c.json({ user, profile: store.profile(user.id) ?? { bio: "", link: "" } });
+    return c.json({
+      user,
+      profile: store.profile(user.id) ?? { bio: "", link: "" },
+      methods: auth.methods(user),
+    });
   });
+
+  // The account's passkeys: when each was added and last signed in.
+  app.get("/auth/passkeys", (c) => c.json({ passkeys: auth.passkeys(signedIn(c)) }));
+
+  // Needs a recent sign-in; refused for the account's last way to sign in.
+  // Ends the sessions made with the passkey, but the caller's.
+  app.post("/auth/passkeys/:id/remove", (c) =>
+    c.json(auth.removePasskey(c.req.header("Authorization"), param(c, "id"))),
+  );
 
   // Another passkey (device) for the signed-in account. Needs a recent
   // sign-in; the flow then ends with the session (e.g. after sign-out
-  // everywhere).
+  // everywhere, checked again when the passkey is added).
   app.post("/auth/passkeys/options", async (c) => {
     return c.json(await auth.addPasskeyOptions(freshUser(c)));
   });
 
   app.post("/auth/passkeys/verify", async (c) => {
-    const user = signedIn(c);
+    signedIn(c);
     const { flowId, response } = await ceremony(c);
-    return c.json(await auth.verifyAddPasskey(user, flowId, response));
+    return c.json(await auth.verifyAddPasskey(c.req.header("Authorization"), flowId, response));
   });
 
   // Lost every passkey: register a new one with the recovery code.
@@ -533,7 +583,7 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
 
   app.post("/auth/recover/verify", async (c) => {
     const { flowId, response } = await ceremony(c);
-    return c.json(await auth.verifyRecovery(flowId, response));
+    return c.json(await auth.verifyRecovery(flowId, response, deviceOf(c)));
   });
 
   // Needs a recent sign-in: whoever holds only a copied token can't take the
@@ -546,6 +596,151 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   // computer). The passkeys stay.
   app.post("/auth/sign-out-everywhere", (c) => {
     return c.json(auth.signOutEverywhere(signedIn(c)));
+  });
+
+  // The account's open sessions (devices signed in), the caller's marked.
+  app.get("/auth/sessions", (c) => c.json({ sessions: auth.sessions(c.req.header("Authorization")) }));
+
+  // End one of your sessions (no recent sign-in needed: it only protects).
+  app.post("/auth/sessions/:id/end", (c) => c.json(auth.endSession(signedIn(c), param(c, "id"))));
+
+  // Ends this session on the server; the page forgets the token either way.
+  app.post("/auth/sign-out", (c) => c.json(auth.signOut(c.req.header("Authorization"))));
+
+  ////////////////////////////////////////////
+  //// Google sign-in (see google.ts)
+
+  // Starts a flow and answers the Google page to send the person to. Linking
+  // a Google account to yours needs a recent sign-in, and the flow is bound
+  // to your account. So is confirming it's you ("confirm", for an account
+  // that signs in only with Google, whose sign-in isn't recent: that's why it
+  // confirms), which needs a linked Google account.
+  app.post("/auth/google/start", async (c) => {
+    const { intent, origin } = await jsonBody(c);
+    let account: GoogleFlowAccount | undefined;
+    if (intent === "link") account = { user: freshUser(c).id };
+    if (intent === "confirm") {
+      const { user, sid } = auth.currentSession(c.req.header("Authorization"));
+      const linked = store.googleOf(user.id);
+      if (linked === undefined) throw new ActionError("No Google account is linked to yours.");
+      account = { user: user.id, sid, loginHint: linked.email || undefined };
+    }
+    const { url } = google.start(intent, origin, account);
+    return c.json({ url });
+  });
+
+  // The page Google sent the person back to hands us the code. A sign-in
+  // answers a session (a new account counts against the sign-up limit, like
+  // a passkey's); a link answers the linked email; a confirm answers a fresh
+  // session if it was the linked Google account, and never makes an account.
+  // Link and confirm need the account that started them still signed in.
+  app.post("/auth/google/finish", async (c) => {
+    const { state, code } = await jsonBody(c);
+    const done = await google.finish(state, code);
+    if (done.intent === "link") {
+      const user = signedIn(c);
+      if (user.id !== done.user) throw new AuthError("This Google link was started for another account.");
+      return c.json(auth.linkGoogle(user, done.identity));
+    }
+    if (done.intent === "confirm") {
+      const user = signedIn(c);
+      if (user.id !== done.user) throw new AuthError("This confirmation was started for another account.");
+      return c.json(auth.confirmWithGoogle(user, done.sid, done.identity, deviceOf(c)));
+    }
+    const key = `signup:${clientIp(c)}`;
+    const signedInWithGoogle = auth.googleSignIn(done.identity, deviceOf(c), () => rateRoom(key, SIGNUPS_PER_HOUR));
+    if (signedInWithGoogle.created) rateCount(key, 60 * 60_000);
+    return c.json(signedInWithGoogle);
+  });
+
+  // Needs a recent sign-in, and a passkey to sign in with afterwards. Ends
+  // the sessions made with Google, but the caller's.
+  app.post("/auth/google/unlink", (c) => c.json(auth.unlinkGoogle(c.req.header("Authorization"))));
+
+  ////////////////////////////////////////////
+  //// export and delete your account
+
+  // Everything Anthill holds about the account, as a JSON download (see
+  // account.ts). Each reads the whole log, so they're limited per account
+  // and per IP, and run one at a time (see MAX_PENDING_EXPORTS).
+  let exportQueue: Promise<unknown> = Promise.resolve();
+  let pendingExports = 0;
+  app.get("/auth/export", async (c) => {
+    const user = signedIn(c);
+    rateLimit(`export:${user.id}`, EXPORTS_PER_HOUR, 60 * 60_000);
+    rateLimit(`export-ip:${clientIp(c)}`, EXPORTS_PER_IP_PER_HOUR, 60 * 60_000);
+    if (pendingExports >= MAX_PENDING_EXPORTS) throw new RateLimitError(Date.now() + 10_000);
+    pendingExports += 1;
+    const run = exportQueue.then(() => {
+      // still signed in once it's this one's turn (not deleted meanwhile)
+      signedIn(c);
+      const standings: Standing[] = communities
+        .all()
+        .filter((tree) => tree.engine.isInTree(user.id) || tree.info.createdBy === user.id)
+        .map((tree) => {
+          const inTree = tree.engine.isInTree(user.id);
+          const parent = tree.engine.parent(user.id);
+          return {
+            id: tree.id,
+            name: tree.info.name,
+            parent: inTree ? (parent === address1 ? null : parent) : undefined,
+            reputation: inTree ? (viewOf(tree).graph.dict[user.id]?.currentRep ?? 0n).toString() : undefined,
+            founder: tree.info.createdBy === user.id,
+          };
+        });
+      return accountExport(store, user.id, standings);
+    });
+    exportQueue = run.catch(() => undefined);
+    let body: string;
+    try {
+      body = await run;
+    } finally {
+      pendingExports -= 1;
+    }
+    c.header("Content-Type", "application/json; charset=utf-8");
+    c.header("Content-Disposition", `attachment; filename="anthill-account-${user.id}.json"`);
+    return c.body(body);
+  });
+
+  // Deletes the account, for good. Needs a recent sign-in and the account's
+  // name typed out. It first leaves every community's tree with a normal
+  // leaveTree action (in each history, and announced like any action). A
+  // leaver's children move up as on any leave: the first child takes their
+  // place, its branch rises, and the second child goes under it; a root's
+  // first child becomes the root, and a root alone leaves the tree empty.
+  // Then one log entry removes every way to sign in, the profile, the
+  // recovery code and every session, renames the account "Deleted account",
+  // and leaves the communities it founded without a founder (their root
+  // changes their settings from then on; an empty public one can be started
+  // by anyone, unless it's closed; an empty private one is seen by nobody, so
+  // it stays empty). The id is never reused, and nothing more is written for
+  // it (see store.ts). Past entries stay in the log: it's the history. The
+  // Google email, kept outside the log, is erased; Google's id for the
+  // account stays in the log.
+  //
+  // The name is compared as it shows (cleanName): names from before names
+  // were cleaned may hold double spaces or invisible characters.
+  app.post("/auth/delete", async (c) => {
+    freshUser(c);
+    const { confirm } = await jsonBody(c);
+    const changed = new Set<OffchainTree>();
+    await serially(async () => {
+      // checked once it's this one's turn: the session may have ended (signed
+      // out everywhere, or the account deleted) while it waited
+      const user = freshUser(c);
+      if (typeof confirm !== "string" || cleanName(confirm) === "" || cleanName(confirm) !== cleanName(user.name)) {
+        throw new ActionError("To confirm, type your account name exactly as it's shown.");
+      }
+      for (const tree of communities.all()) {
+        if (tree.info.createdBy === user.id) changed.add(tree);
+        if (!tree.engine.isInTree(user.id)) continue;
+        await record(tree.execute(user.id, { fn: "leaveTree" }));
+        changed.add(tree);
+      }
+      store.deleteAccount(user.id);
+    });
+    notify([...changed]);
+    return c.json({ ok: true });
   });
 
   // Rename the account, and its node in every community it's in.
@@ -598,7 +793,8 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
     return c.json({ community: summary(visibleTree(c, viewer), viewer) });
   });
 
-  // Founder only: name, description, visibility and join policy.
+  // Founder only (the tree's root without one, see updateSettings): name,
+  // description, visibility and join policy.
   app.post("/c/:cid/settings", async (c) => {
     const user = signedIn(c);
     const tree = visibleTree(c, user.id);
@@ -766,8 +962,13 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
     const tree = stored && communities.get(store.communityOf(stored));
     if (tree === undefined) throw new ActionError("This invite link isn't valid.");
     const invite = tree.validInvite(code);
+    // Who holds the link sees what they need to decide: the community's name,
+    // description and size, and who invited them. A private one's founder
+    // and root stay for its members.
+    const viewer = viewerOf(c);
+    const community = summary(tree, viewer);
     return c.json({
-      community: summary(tree, viewerOf(c)),
+      community: tree.visibleTo(viewer) ? community : { ...community, founder: null, rootName: "" },
       inviter: {
         id: invite.under,
         name: store.user(invite.under)?.name ?? viewOf(tree).graph.dict[invite.under]?.name ?? "",

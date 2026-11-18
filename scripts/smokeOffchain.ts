@@ -7,8 +7,10 @@
 // communities (joining, invites, privacy, settings, renaming across them, one
 // name per account, update keys, name cleaning, body limits, no-op writes,
 // poll caps and leavers' votes, an emptied tree), adds a second passkey, recovers with the recovery code (which
-// ends old sessions and passkeys, once per code), signs out everywhere and
-// downloads the log as admin.
+// ends old sessions and passkeys, once per code), signs out everywhere, lists
+// and ends sessions, signs out, downloads an account's data, deletes an
+// account (a founder and root with a member under them), checks CORS and the
+// security headers, and downloads the log as admin.
 //
 //   PORT=5098 DATA_DIR=/tmp/anthill-smoke ADMIN_TOKEN=smoke-admin npx tsx src/App.ts
 //   BACKEND=http://localhost:5098/ ADMIN_TOKEN=smoke-admin npx tsx scripts/smokeOffchain.ts
@@ -21,8 +23,20 @@ import { SoftPasskey } from "./softPasskey";
 
 const backend = process.env.BACKEND || "http://localhost:5098/";
 
+// Posts to /auth/ are limited to 60 a minute per IP, which a run this long
+// goes past: then wait for the window to end and try again, as a person would.
+async function send(path: string, init: RequestInit) {
+  for (;;) {
+    const res = await fetch(backend + path, init);
+    if (res.status !== 429 || init.method !== "POST" || !path.startsWith("auth/")) return res;
+    const wait = Number(res.headers.get("Retry-After") ?? 5);
+    console.log(`(sign-in rate limit, waiting ${wait}s)`);
+    await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+  }
+}
+
 async function call(path: string, body?: unknown, token?: string) {
-  const res = await fetch(backend + path, {
+  const res = await send(path, {
     method: body === undefined ? "GET" : "POST",
     headers: {
       "Content-Type": "application/json",
@@ -49,12 +63,14 @@ async function register(passkey: SoftPasskey, name: string) {
   };
 }
 
-async function signIn(passkey: SoftPasskey) {
+async function signIn(passkey: SoftPasskey, userAgent?: string) {
   const options = await call("auth/login/options", {});
-  const verified = await call("auth/login/verify", {
-    flowId: options.data.flowId,
-    response: passkey.get(options.data.options),
+  const res = await send("auth/login/verify", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(userAgent ? { "User-Agent": userAgent } : {}) },
+    body: JSON.stringify({ flowId: options.data.flowId, response: passkey.get(options.data.options) }),
   });
+  const verified = { status: res.status, data: (await res.json()) as any };
   assert.equal(verified.status, 200, JSON.stringify(verified.data));
   return verified.data as { token: string; user: { id: string; name: string } };
 }
@@ -739,6 +755,114 @@ async function main() {
     assert.equal((await call("auth/me", undefined, again.token)).status, 200);
   }
   console.log("ok: sign out everywhere");
+
+  // Sessions: each sign-in is one, labelled by its device; one can be ended
+  // from another, and signing out ends the caller's.
+  {
+    const firefox = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
+    const desk = await signIn(newPhone, firefox);
+    const pocket = await signIn(newPhone);
+    const { sessions } = (await call("auth/sessions", undefined, pocket.token)).data;
+    assert.ok(sessions.length >= 3, JSON.stringify(sessions));
+    assert.equal(sessions[0].current, true);
+    assert.equal(sessions[0].method, "passkey");
+    const deskSession = sessions.find((s: any) => s.device === "Firefox on Windows");
+    assert.ok(deskSession, JSON.stringify(sessions));
+    assert.equal((await call(`auth/sessions/${deskSession.id}/end`, {}, pocket.token)).status, 200);
+    assert.equal((await call("auth/me", undefined, desk.token)).status, 401);
+    assert.equal((await call("auth/sign-out", {}, pocket.token)).status, 200);
+    assert.equal((await call("auth/me", undefined, pocket.token)).status, 401);
+    assert.equal((await call(`auth/sessions/${deskSession.id}/end`, {}, (await signIn(newPhone)).token)).status, 400);
+  }
+  console.log("ok: sessions listed, ended, signed out");
+
+  // Sign-in methods: no Google configured here; the only passkey can't go.
+  {
+    assert.deepEqual((await call("auth/methods")).data, { passkey: true, google: false });
+    const current = await signIn(newPhone);
+    const me = (await call("auth/me", undefined, current.token)).data;
+    assert.deepEqual(me.methods, { passkeys: 1, google: null, recoveryCode: true });
+    const { passkeys } = (await call("auth/passkeys", undefined, current.token)).data;
+    assert.equal(passkeys.length, 1);
+    assert.ok(passkeys[0].lastUsedAt);
+    const removed = await call(`auth/passkeys/${encodeURIComponent(passkeys[0].id)}/remove`, {}, current.token);
+    assert.equal(removed.status, 400, JSON.stringify(removed.data));
+  }
+  console.log("ok: sign-in methods and passkeys");
+
+  // Download my data: a JSON attachment, never cached, with no keys.
+  {
+    const current = await signIn(newPhone);
+    const res = await fetch(`${backend}auth/export`, { headers: { Authorization: `Bearer ${current.token}` } });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("Content-Disposition") ?? "", /^attachment; filename=/);
+    assert.equal(res.headers.get("Cache-Control"), "no-store");
+    const text = await res.text();
+    const data = JSON.parse(text);
+    assert.equal(data.account.id, session.user.id);
+    assert.ok(data.communities.some((c: any) => c.id === "demo" && c.parent !== undefined));
+    assert.ok(data.log.some((e: any) => e.type === "action" && e.by === session.user.id));
+    assert.ok(!text.includes('"publicKey"') && !text.includes('"hash"'));
+  }
+  console.log("ok: account export");
+
+  // Deleting an account: a founder and root with a member under them leaves
+  // the tree (the member becomes its root, and runs the founderless
+  // community), and can't sign in again.
+  {
+    const leaverKey = new SoftPasskey();
+    const leaver = await register(leaverKey, "Leaver");
+    const stayer = await register(new SoftPasskey(), "Stayer");
+    const settings = { name: "Leaving soon", visibility: "public", joinPolicy: "open" };
+    assert.equal((await call("communities", { id: "smoke-leave", ...settings }, leaver.token)).status, 200);
+    const joined = await call(
+      "c/smoke-leave/action",
+      { fn: "joinTree", args: { name: "Stayer", recipient: leaver.user.id } },
+      stayer.token,
+    );
+    assert.equal(joined.status, 200, JSON.stringify(joined.data));
+    assert.equal((await call("auth/delete", { confirm: "Not my name" }, leaver.token)).status, 400);
+    const deleted = await call("auth/delete", { confirm: "Leaver" }, leaver.token);
+    assert.equal(deleted.status, 200, JSON.stringify(deleted.data));
+    const graph = (await call("c/smoke-leave/graph")).data;
+    assert.equal(graph.rootId, stayer.user.id);
+    assert.equal(graph.nodes[leaver.user.id], undefined);
+    assert.equal(graph.community.founder, null);
+    assert.equal((await call("c/smoke-leave/settings", { ...settings, name: "Stayer's now" }, stayer.token)).status, 200);
+    assert.equal((await call("auth/me", undefined, leaver.token)).status, 401);
+    const options = await call("auth/login/options", {});
+    const again = await call("auth/login/verify", {
+      flowId: options.data.flowId,
+      response: leaverKey.get(options.data.options),
+    });
+    assert.equal(again.status, 401, JSON.stringify(again.data));
+    assert.equal((await call("auth/recover/options", { code: leaver.recoveryCode })).status, 401);
+  }
+  console.log("ok: account deletion");
+
+  // Headers: security headers everywhere, CORS for the frontend's origin and
+  // for anyone's public reads only.
+  {
+    const ours = process.env.ORIGIN || "http://localhost:5173";
+    const res = await fetch(`${backend}communities`, { headers: { Origin: "https://elsewhere.example" } });
+    assert.equal(res.headers.get("Access-Control-Allow-Origin"), "*");
+    assert.equal(res.headers.get("X-Content-Type-Options"), "nosniff");
+    assert.equal(res.headers.get("X-Frame-Options"), "DENY");
+    assert.equal(res.headers.get("Strict-Transport-Security"), "max-age=63072000; includeSubDomains");
+    assert.equal(res.headers.get("Cross-Origin-Resource-Policy"), "cross-origin");
+    const signedIn = await fetch(`${backend}auth/me`, {
+      headers: { Origin: "https://elsewhere.example", Authorization: "Bearer x" },
+    });
+    assert.equal(signedIn.headers.get("Access-Control-Allow-Origin"), null);
+    assert.equal(signedIn.headers.get("Cache-Control"), "no-store");
+    const preflight = await fetch(`${backend}action`, {
+      method: "OPTIONS",
+      headers: { Origin: ours, "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "authorization" },
+    });
+    assert.equal(preflight.headers.get("Access-Control-Allow-Origin"), ours);
+    assert.match(preflight.headers.get("Access-Control-Allow-Headers") ?? "", /Authorization/);
+  }
+  console.log("ok: headers and CORS");
 
   // Admin log download.
   assert.equal((await call("admin/log")).status, 401);
