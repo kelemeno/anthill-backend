@@ -33,7 +33,7 @@ import {
 } from "./dagProcessing";
 import { buildHistory, type History } from "./dagHistory";
 import { corsPolicy, securityHeaders } from "./headers";
-import { NotFoundError, RateLimitError, clientIp, rateLimit } from "./http";
+import { NotFoundError, RateLimitError, RelayError, clientIp, rateLimit } from "./http";
 import {
   NodeDataBareCollapse,
   NodeDataStoreCollapse,
@@ -174,7 +174,10 @@ app.onError((err, c) => {
     return c.json({ error: err.message, code: err.code }, 400);
   }
   if (err instanceof NotFoundError) {
-    return c.json({ error: "Not found" }, 404);
+    return c.json({ error: err.message || "Not found" }, 404);
+  }
+  if (err instanceof RelayError) {
+    return c.json({ error: err.message, code: err.code }, 502);
   }
   if (err instanceof RateLimitError) {
     const seconds = Math.max(1, Math.ceil((err.retryAt - Date.now()) / 1000));

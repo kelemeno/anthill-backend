@@ -6,7 +6,8 @@
 // a second user, sets a profile, runs a poll, starts public and private
 // communities (joining, invites, privacy, settings, renaming across them, one
 // name per account, update keys, name cleaning, body limits, no-op writes,
-// poll caps and leavers' votes, an emptied tree), adds a second passkey, recovers with the recovery code (which
+// poll caps and leavers' votes, an emptied tree, no agent routes without a
+// commons), adds a second passkey, recovers with the recovery code (which
 // ends old sessions and passkeys, once per code), signs out everywhere, lists
 // and ends sessions, signs out, downloads an account's data, deletes an
 // account (a founder and root with a member under them), checks CORS and the
@@ -361,6 +362,17 @@ async function main() {
   assert.equal(pub.data.community.members, 1);
   assert.equal(pub.data.community.isFounder, true);
   assert.equal(pub.data.community.you.rank, 1);
+  // no agent commons here (COMMONS_SITES unset): the agent routes are 404s
+  assert.equal(pub.data.community.commons, null);
+  for (const [path, body] of [
+    ["c/smoke-public/commons/pairings", { modelFamily: "claude", harness: "claude-code" }],
+    ["c/smoke-public/commons/pairings/claim-status", { code: "ABCD-EFGH-JKLM-NPQR-STUV-WXYZ" }],
+    ["c/smoke-public/commons/pairings", undefined],
+    ["c/smoke-public/commons/agents", undefined],
+    ["c/smoke-public/commons/agent.md", undefined],
+  ] as const) {
+    assert.equal((await call(path, body, session.token)).status, 404, path);
+  }
   for (const id of ["smoke-public", "A!", "admin", "-x-"]) {
     const bad = await call(
       "communities",

@@ -20,6 +20,18 @@ export class RateLimitError extends Error {
 // A community that doesn't exist, or that the viewer may not see.
 export class NotFoundError extends Error {}
 
+// A server Anthill relays to (a commons' coordinator) couldn't be reached or
+// refused: a 502, with what to tell the person. `code` is the other server's
+// error code, when it gave one.
+export class RelayError extends Error {
+  constructor(
+    message: string,
+    readonly code?: string,
+  ) {
+    super(message);
+  }
+}
+
 // Fixed windows (a minute unless given) per client IP or user, to blunt
 // scripted sign-ups and spam.
 const rateWindows = new Map<string, { count: number; reset: number }>();
@@ -135,6 +147,23 @@ export function requireAdmin(c: Req) {
   if (!token || !timingSafeEqual(digest(given), digest(token))) {
     throw new AuthError("admin only");
   }
+}
+
+// A body that may be left out (no body, or an empty one, is `{}`); one
+// that's there must be a JSON object, as for jsonBody.
+export async function optionalJsonBody(c: { req: { text: () => Promise<string> } }) {
+  const text = await c.req.text();
+  if (text.trim() === "") return {};
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new ActionError("expected a JSON body");
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new ActionError("expected a JSON object");
+  }
+  return body as Record<string, unknown>;
 }
 
 // The parsed body, which must be a JSON object: routes destructure it, and

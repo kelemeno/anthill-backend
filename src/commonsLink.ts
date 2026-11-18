@@ -5,18 +5,24 @@
 // - the community's tree, signed, which the commons pins in its ledger and
 //   draws reviewers over (people far apart in the tree review each other);
 // - attestations that a commons signing key belongs to a member, so members
-//   join the commons as themselves, with their Anthill user id.
+//   join the commons as themselves, with their Anthill user id;
+// - attestations that an agent key is a member's agent (and, later, that the
+//   member revoked it): a member pairs an agent on the website, without an
+//   owner key of their own, and Anthill vouches for it (see commonsAgents.ts).
 //
-// Both are ed25519 signatures over domain-separated canonical JSON. The
+// All are ed25519 signatures over domain-separated canonical JSON. The
 // commons checks them in src/anthill.ts and src/ledger.ts; the message format
-// here must match its treeMessage and ownerMessage byte for byte.
+// here must match its treeMessage, ownerMessage, agentMessage and
+// agentRevokeMessage byte for byte. The agent signs one message itself: its
+// pairing claim (pairMessage), which proves it holds the key it names; the
+// commons' `commons-agent pair` makes it.
 //
 // The signing key is ANTHILL_SIGNING_KEY (an ed25519 PKCS8 DER key, base64url)
 // or, without it, one generated once and kept in the data folder. A commons
 // records the public key (GET /commons/key) when it is created, so replacing
 // the key cuts every linked commons off until it is re-linked: keep the file.
 
-import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify, type KeyObject } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { address1 } from "./engine";
@@ -24,6 +30,9 @@ import type { OffchainTree } from "./offchain";
 
 export const TREE_DOMAIN = "anthill-commons/tree/v1";
 export const OWNER_DOMAIN = "anthill-commons/owner/v1";
+export const AGENT_DOMAIN = "anthill-commons/agent/v1";
+export const AGENT_REVOKE_DOMAIN = "anthill-commons/agent-revoke/v1";
+export const PAIR_DOMAIN = "anthill-commons/pair/v1";
 
 export type TreeSnapshot = {
   community: string;
@@ -37,6 +46,34 @@ export type OwnerAttestation = {
   user: string;
   publicKey: string;
   at: string;
+};
+
+// `agentKey` is the agent's public key (base64url SPKI DER), `user` the
+// member it works for, `at` when Anthill signed (ISO, ms, UTC).
+export type AgentAttestation = {
+  agentKey: string;
+  at: string;
+  community: string;
+  harness: string;
+  modelFamily: string;
+  user: string;
+};
+
+export type AgentRevokeAttestation = {
+  agentKey: string;
+  at: string;
+  community: string;
+  reason: string;
+  user: string;
+};
+
+// What an agent signs with its own key to claim a pairing code.
+export type PairClaim = {
+  agentKey: string;
+  code: string;
+  community: string;
+  harness: string;
+  modelFamily: string;
 };
 
 // Deterministic JSON, as the commons' crypto.canonical: object keys sorted, no
@@ -61,6 +98,9 @@ export function canonical(value: unknown): string {
 
 export const treeMessage = (s: TreeSnapshot) => `${TREE_DOMAIN}\n${canonical(s)}`;
 export const ownerMessage = (a: OwnerAttestation) => `${OWNER_DOMAIN}\n${canonical(a)}`;
+export const agentMessage = (a: AgentAttestation) => `${AGENT_DOMAIN}\n${canonical(a)}`;
+export const agentRevokeMessage = (a: AgentRevokeAttestation) => `${AGENT_REVOKE_DOMAIN}\n${canonical(a)}`;
+export const pairMessage = (p: PairClaim) => `${PAIR_DOMAIN}\n${canonical(p)}`;
 
 export class CommonsSigner {
   private key: KeyObject;
@@ -103,6 +143,20 @@ export class CommonsSigner {
     return { attestation, signature: this.sign(ownerMessage(attestation)) };
   }
 
+  // Only the fields of the message are signed and handed on: a caller's
+  // extra fields never reach the commons.
+  agent(a: AgentAttestation): { attestation: AgentAttestation; signature: string } {
+    const { agentKey, at, community, harness, modelFamily, user } = a;
+    const attestation: AgentAttestation = { agentKey, at, community, harness, modelFamily, user };
+    return { attestation, signature: this.sign(agentMessage(attestation)) };
+  }
+
+  agentRevoke(a: AgentRevokeAttestation): { attestation: AgentRevokeAttestation; signature: string } {
+    const { agentKey, at, community, reason, user } = a;
+    const attestation: AgentRevokeAttestation = { agentKey, at, community, reason, user };
+    return { attestation, signature: this.sign(agentRevokeMessage(attestation)) };
+  }
+
   private sign(message: string): string {
     return sign(null, Buffer.from(message, "utf8"), this.key).toString("base64url");
   }
@@ -118,6 +172,36 @@ export function isCommonsPublicKey(v: unknown): v is string {
     if (der.toString("base64url") !== v) return false;
     const key = createPublicKey({ key: der, format: "der", type: "spki" });
     return key.asymmetricKeyType === "ed25519" && key.export({ type: "spki", format: "der" }).toString("base64url") === v;
+  } catch {
+    return false;
+  }
+}
+
+// The commons' name for a key: the first 32 hex characters of the sha256 of
+// its DER (its crypto.keyIdOf).
+export function keyIdOf(publicKey: string): string {
+  return createHash("sha256").update(Buffer.from(publicKey, "base64url")).digest("hex").slice(0, 32);
+}
+
+// What the agent prints and the member compares on the website before
+// approving: the first 8 bytes of the same hash, as 4 groups of 4 hex
+// characters (3f2a-91bc-07de-55e1). Short enough to compare by eye; a
+// stranger would have to grind 64 bits to match it, within the pairing's
+// half hour.
+export function fingerprintOf(publicKey: string): string {
+  return keyIdOf(publicKey).slice(0, 16).match(/.{4}/g)!.join("-");
+}
+
+// Whether `proof` is the agent key's signature over its claim, in the one
+// spelling the commons accepts (64 bytes, canonical base64url). The key must
+// already have passed isCommonsPublicKey.
+export function verifyPairProof(claim: PairClaim, proof: unknown): boolean {
+  if (typeof proof !== "string" || proof.length > 200) return false;
+  try {
+    const raw = Buffer.from(proof, "base64url");
+    if (raw.length !== 64 || raw.toString("base64url") !== proof) return false;
+    const key = createPublicKey({ key: Buffer.from(claim.agentKey, "base64url"), format: "der", type: "spki" });
+    return verify(null, Buffer.from(pairMessage(claim), "utf8"), key, raw);
   } catch {
     return false;
   }

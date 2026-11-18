@@ -10,6 +10,10 @@
 // in it, and probing is rate limited); pick an unguessable address if even
 // that matters.
 //
+// Communities with an agent commons (COMMONS_SITES) also have pairing
+// routes for members' agents, their agents' list and revoke, and the agent
+// instructions page (see commonsAgents.ts); others answer 404 there.
+//
 // The WebSocket says "update:<key>" after a change in a community: the key is
 // the id of a public one, and an opaque key for a private one (in its /graph
 // response as `updateKey`, so only its members can tell). A bare "update"
@@ -25,7 +29,26 @@ import type { Context, Hono } from "hono";
 import { accountExport, type Standing } from "./account";
 import type { AnthillContractType } from "./anthillContract";
 import { AuthError, deviceLabel, PasskeyAuth } from "./auth";
-import { CommonsSigner, isCommonsPublicKey } from "./commonsLink";
+import {
+  agentView,
+  CommonsRelay,
+  type CommonsSite,
+  isHarness,
+  isModelFamily,
+  kitCommit,
+  loopPrompt,
+  type Pairing,
+  pairingPrompt,
+  Pairings,
+  pairingView,
+  parseCommonsSites,
+  parseHarness,
+  parseModelFamily,
+  parseReason,
+  renderAgentMd,
+  SETTLE_MS,
+} from "./commonsAgents";
+import { CommonsSigner, isCommonsPublicKey, verifyPairProof } from "./commonsLink";
 import { address0, address1, type GraphData } from "./dagBase";
 import { type History, type HistoryNode, type HistoryStep, snapshotNodes } from "./dagHistory";
 import { loadAnthillGraph } from "./dagLoading";
@@ -41,7 +64,9 @@ import {
   clientIp,
   jsonBody,
   NotFoundError,
+  optionalJsonBody,
   RateLimitError,
+  RelayError,
   rateCount,
   rateLimit,
   rateRoom,
@@ -306,11 +331,12 @@ const LEGACY_PATHS = new Set([
 
 // Registers the routes (they must exist before the first request) and returns
 // start(), which rebuilds everything from the log. `options.google` replaces
-// Google's endpoints and config (for the checks).
+// Google's endpoints and config, and `options.fetch` the requests to commons
+// coordinators (for the checks).
 export function offchainServer(
   app: Hono,
   broadcast: (message: string) => void,
-  options: { google?: GoogleOptions } = {},
+  options: { google?: GoogleOptions; fetch?: typeof fetch } = {},
 ) {
   const dataDir = process.env.DATA_DIR || join(process.cwd(), "data");
   const snapshotPath = join(process.cwd(), "anthillSnapshot.json");
@@ -351,6 +377,16 @@ export function offchainServer(
   const keySecret = process.env.SESSION_SECRET || store.sessionSecret(() => randomBytes(32).toString("hex"));
   const google = new GoogleSignIn(keySecret, options.google);
   const commonsSigner = new CommonsSigner(dataDir);
+  // read now: a mistake in either stops the server here, not on a request
+  const commonsSites = parseCommonsSites(process.env.COMMONS_SITES);
+  const commonsKit = kitCommit();
+  const pairings = new Pairings();
+  const relay = new CommonsRelay(options.fetch);
+  // This backend's public address, for the URLs agents are given: PUBLIC_URL,
+  // else the one Render gives the service, else (developing locally) the
+  // address the request came to.
+  const publicUrl = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/+$/, "");
+  if (publicUrl !== "" && !/^https?:\/\/[^/?#]+(\/[^?#]*)?$/.test(publicUrl)) throw new Error("PUBLIC_URL must be an http(s) URL");
   const communities = new Communities(store);
   const views = new Map<string, TreeView>();
   const polls = new Map<string, Polls>();
@@ -464,6 +500,13 @@ export function offchainServer(
     return tree;
   }
 
+  // (repo too, when the operator named it: the Agents page lists the hosts an
+  // agent's sandbox must reach)
+  function commonsOf(id: string): CommonsSite | undefined {
+    const site = commonsSites.get(id);
+    return site === undefined ? undefined : { coordinator: site.coordinator, site: site.site, ...(site.repo === undefined ? {} : { repo: site.repo }) };
+  }
+
   function summary(tree: OffchainTree, viewer?: string) {
     const { id, name, description, visibility, joinPolicy, createdBy, createdAt } = tree.info;
     const steward = createdBy || tree.engine.root();
@@ -479,6 +522,8 @@ export function offchainServer(
       joinPolicy,
       createdAt,
       founder: createdBy === "" ? null : { id: createdBy, name: store.user(createdBy)?.name ?? "" },
+      // where its agent commons is, when it has one
+      commons: commonsOf(id) ?? null,
       members: members.length,
       rootName: dict[rootId]?.name ?? "",
       isFounder: viewer !== undefined && viewer === createdBy,
@@ -723,14 +768,19 @@ export function offchainServer(
   app.post("/auth/delete", async (c) => {
     freshUser(c);
     const { confirm } = await jsonBody(c);
+    // again once the body is in: the session may have ended meanwhile
+    const asking = freshUser(c);
+    const confirmed = (name: string) => typeof confirm === "string" && cleanName(confirm) !== "" && cleanName(confirm) === cleanName(name);
+    if (!confirmed(asking.name)) throw new ActionError("To confirm, type your account name exactly as it's shown.");
+    // its agents in every commons first (no write lock held while asking):
+    // nothing is deleted unless that worked
+    await revokeAllAgents(asking.id);
     const changed = new Set<OffchainTree>();
     await serially(async () => {
       // checked once it's this one's turn: the session may have ended (signed
       // out everywhere, or the account deleted) while it waited
       const user = freshUser(c);
-      if (typeof confirm !== "string" || cleanName(confirm) === "" || cleanName(confirm) !== cleanName(user.name)) {
-        throw new ActionError("To confirm, type your account name exactly as it's shown.");
-      }
+      if (!confirmed(user.name)) throw new ActionError("To confirm, type your account name exactly as it's shown.");
       for (const tree of communities.all()) {
         if (tree.info.createdBy === user.id) changed.add(tree);
         if (!tree.engine.isInTree(user.id)) continue;
@@ -956,6 +1006,389 @@ export function offchainServer(
     return c.json(commonsSigner.owner(tree.id, user.id, publicKey, new Date().toISOString()));
   });
 
+  ////////////////////////////////////////////
+  //// members' agents in the commons (see commonsAgents.ts)
+
+  // The community's commons, or a 404: these routes exist only where the
+  // operator configured one.
+  function siteOf(tree: OffchainTree): CommonsSite {
+    const site = commonsSites.get(tree.id);
+    if (site === undefined) throw new NotFoundError();
+    return site;
+  }
+
+  const backendOf = (c: Context) => publicUrl || new URL(c.req.url).origin;
+
+  // For the agent's routes (no session): the community must exist and have
+  // a commons. Its visibility isn't checked: the code is the secret, and a
+  // wrong one learns nothing.
+  function agentSide(c: Context) {
+    const tree = communities.get(cidOf(c));
+    if (tree === undefined) throw new NotFoundError();
+    siteOf(tree);
+    return tree;
+  }
+
+  const noPairing = () => new NotFoundError("No pairing has that code. Check it, or ask your owner for a new one.");
+
+  // Agents pair only in a public community: the agent reads agent.md, and
+  // the coordinator the community's tree, without an Anthill session, and a
+  // private community shows neither to them (nor where its commons is).
+  function publicOnly(tree: OffchainTree) {
+    if (tree.info.visibility !== "public") {
+      throw new ActionError("Agents can connect only to a public community's commons: this one is private.", "private community");
+    }
+  }
+
+  // Signs and relays the revocation of one of `user`'s agents in `tree`'s
+  // commons ("already" if the commons had it revoked).
+  async function revokeAgent(site: CommonsSite, tree: OffchainTree, user: string, agentKey: string, reason: string) {
+    const signed = commonsSigner.agentRevoke({ agentKey, at: new Date().toISOString(), community: tree.id, reason, user });
+    try {
+      return await relay.revokeAgent(site, signed);
+    } finally {
+      relay.forget(site, user);
+    }
+  }
+
+  // Whether an approval whose answer was lost (p.attemptedAt) is in the
+  // ledger: "active" when the coordinator lists the key as this member's,
+  // active; "absent" when it doesn't (and the attempt was long enough ago
+  // that it won't land now), or lists it revoked; "unsure" when that can't
+  // be known now.
+  async function lostApproval(site: CommonsSite, p: Pairing): Promise<"active" | "absent" | "unsure"> {
+    const keyId = p.claim?.keyId;
+    if (keyId === undefined || p.attemptedAt === undefined) return "absent";
+    const since = p.attemptedAt;
+    let known;
+    try {
+      known = (await relay.agentsOf(site, p.user, { fresh: true })).find((a) => a.keyId === keyId);
+    } catch (e) {
+      if (e instanceof RelayError || e instanceof ActionError || e instanceof RateLimitError) return "unsure";
+      throw e;
+    } finally {
+      p.checkedAt = Date.now();
+    }
+    if (known?.active) return "active";
+    if (known !== undefined) return "absent";
+    return Date.now() > since + SETTLE_MS ? "absent" : "unsure";
+  }
+
+  // A pairing whose approval may have landed isn't expired by the clock
+  // alone (Pairings.sweep): once its time is up, the coordinator decides. The
+  // member did approve it, so it ends approved if the agent is there, and
+  // expired if not; it stays as it is while that can't be known. Asked at
+  // most every half minute, whoever polls.
+  async function settleLost(site: CommonsSite, p: Pairing) {
+    const now = Date.now();
+    if (p.attemptedAt === undefined || p.relaying || p.status !== "claimed" || now <= p.expiresAt) return;
+    if (p.checkedAt !== undefined && now < p.checkedAt + 30_000) return;
+    p.relaying = true;
+    try {
+      const found = await lostApproval(site, p);
+      if (found === "active") pairings.end(p, "approved");
+      if (found === "absent") pairings.end(p, "expired");
+    } finally {
+      p.relaying = false;
+    }
+  }
+
+  // The member's own pairing, or a 404.
+  function myPairing(c: Context, user: string, tree: OffchainTree): Pairing {
+    const p = pairings.ofUser(param(c, "id"), user, tree.id);
+    if (p === undefined) throw new NotFoundError();
+    return p;
+  }
+
+  // Connect an agent: a one-time code, and the prompt (and loop prompt) to
+  // copy into the agent, with what it should declare. Members only; at most
+  // OPEN_PER_USER waiting at once.
+  route("POST", "/commons/pairings", async (c) => {
+    const user = signedIn(c);
+    rateLimit(`pairing-new:${user.id}`, 10);
+    const tree = visibleTree(c, user.id);
+    const site = siteOf(tree);
+    if (!tree.isMember(user.id)) throw new ActionError("Only members of this community can connect an agent.", "not member");
+    publicOnly(tree);
+    const body = await jsonBody(c);
+    const modelFamily = parseModelFamily(body.modelFamily);
+    const harness = parseHarness(body.harness);
+    // ones whose approval may have landed, out of time, settled first
+    for (const p of pairings.mine(user.id, tree.id)) await settleLost(site, p);
+    const { pairing, code } = pairings.create(user.id, tree.id, { modelFamily, harness });
+    const backend = backendOf(c);
+    const expiresAt = new Date(pairing.expiresAt).toISOString();
+    return c.json({
+      id: pairing.id,
+      code,
+      expiresAt,
+      prompt: pairingPrompt({
+        person: store.user(user.id)?.name ?? user.name,
+        community: tree.id,
+        backend,
+        code,
+        expiresAt,
+        modelFamily,
+        harness,
+      }),
+      loopPrompt: loopPrompt(backend, tree.id),
+    });
+  });
+
+  // The member's pairings still open or claimed here (no codes: they're
+  // shown once), so a page that lost one (a reload, another tab) can approve
+  // or reject it.
+  route("GET", "/commons/pairings", (c) => {
+    const user = signedIn(c);
+    rateLimit(`pairing-read:${user.id}`, 120);
+    const tree = visibleTree(c, user.id);
+    siteOf(tree);
+    return c.json({ pairings: pairings.mine(user.id, tree.id).map(pairingView) });
+  });
+
+  // The agent claims a code with its key (commons-agent pair). `proof` is
+  // the agent key's signature over the claim (pairMessage), so it can only
+  // name a key it holds. One claim per code; a bad proof doesn't use it up.
+  route("POST", "/commons/pairings/claim", async (c) => {
+    rateLimit(`pairing-claim:${clientIp(c)}`, 30);
+    const tree = agentSide(c);
+    const { code, agentKey, modelFamily, harness, proof } = await jsonBody(c);
+    if (!isCommonsPublicKey(agentKey)) throw new ActionError("agentKey must be an ed25519 public key (base64url SPKI DER)");
+    // exactly as the agent signed them: tidying them here would break the proof
+    if (!isModelFamily(modelFamily)) throw new ActionError("modelFamily must be one lowercase name, like claude, gpt or other.");
+    if (!isHarness(harness)) {
+      throw new ActionError("harness must be 1-64 printable ASCII characters, words separated by single spaces, like claude-code.");
+    }
+    const p = pairings.ofCode(code, tree.id);
+    if (p === undefined) throw noPairing();
+    if (!verifyPairProof({ agentKey, code, community: tree.id, harness, modelFamily }, proof)) {
+      throw new ActionError("The proof isn't this agent key's signature over the claim.", "bad proof");
+    }
+    pairings.claim(p, { agentKey, modelFamily, harness });
+    return c.json({ status: "claimed", fingerprint: p.claim!.fingerprint, expiresAt: new Date(p.expiresAt).toISOString() });
+  });
+
+  // The agent waits for its owner's answer. A POST, so the code isn't in a
+  // URL (and the logs that keep them).
+  route("POST", "/commons/pairings/claim-status", async (c) => {
+    rateLimit(`pairing-status:${clientIp(c)}`, 120);
+    const tree = agentSide(c);
+    const { code } = await jsonBody(c);
+    const p = pairings.ofCode(code, tree.id);
+    if (p === undefined) throw noPairing();
+    await settleLost(siteOf(tree), p);
+    const status = pairings.status(p);
+    return c.json({
+      status,
+      expiresAt: new Date(p.expiresAt).toISOString(),
+      ...(p.claim === undefined ? {} : { fingerprint: p.claim.fingerprint }),
+      ...(status === "approved" && p.claim !== undefined ? { agent: { keyId: p.claim.keyId } } : {}),
+    });
+  });
+
+  // The member's page polls its pairing, to show the claim to approve.
+  route("GET", "/commons/pairings/:id", async (c) => {
+    const user = signedIn(c);
+    rateLimit(`pairing-read:${user.id}`, 120);
+    const tree = visibleTree(c, user.id);
+    const site = siteOf(tree);
+    const p = myPairing(c, user.id, tree);
+    await settleLost(site, p);
+    pairings.status(p);
+    return c.json(pairingView(p));
+  });
+
+  // The member approves the claimed agent (after comparing fingerprints):
+  // Anthill signs that the agent is theirs and relays it to the coordinator.
+  // If that fails the pairing stays approvable. A key the commons already has
+  // is done if it's this member's active agent (a repeat), and refused if it's
+  // someone else's or was revoked (see CommonsRelay.registerAgent).
+  //
+  // When no answer comes back (a timeout, a reset, a 5xx) the attestation may
+  // be in the ledger all the same: the pairing remembers that (attemptedAt),
+  // Anthill asks the coordinator at once, and until it knows, rejecting it
+  // asks again (and revokes what landed) and it doesn't expire unasked.
+  route("POST", "/commons/pairings/:id/approve", async (c) => {
+    const user = signedIn(c);
+    rateLimit(`pairing-approve:${user.id}`, 10);
+    const tree = visibleTree(c, user.id);
+    const site = siteOf(tree);
+    const p = myPairing(c, user.id, tree);
+    if (!tree.isMember(user.id)) throw new ActionError("Only members of this community can connect an agent.", "not member");
+    const status = pairings.status(p);
+    const claim = p.claim;
+    const agent = claim && { keyId: claim.keyId, modelFamily: claim.modelFamily, harness: claim.harness };
+    if (status === "approved") return c.json({ agent });
+    if (status === "open") throw new ActionError("No agent has claimed this code yet.", "not claimed");
+    if (status === "expired") throw new ActionError("This pairing has expired: connect the agent again.", "expired");
+    if (status === "rejected") throw new ActionError("This pairing was rejected: connect the agent again.", "rejected");
+    if (p.relaying || claim === undefined) throw new ActionError("This agent is already being approved.", "approving");
+    publicOnly(tree);
+    p.relaying = true;
+    // an earlier attempt that got no answer still may land
+    const earlier = p.attemptedAt;
+    try {
+      const signed = commonsSigner.agent({
+        agentKey: claim.agentKey,
+        at: new Date().toISOString(),
+        community: tree.id,
+        harness: claim.harness,
+        modelFamily: claim.modelFamily,
+        user: user.id,
+      });
+      p.attemptedAt = Date.now();
+      let answer: Awaited<ReturnType<CommonsRelay["registerAgent"]>>;
+      try {
+        answer = await relay.registerAgent(site, signed);
+      } catch (e) {
+        if (!(e instanceof RelayError)) {
+          // refused, or never sent (over the budget): this one didn't land
+          p.attemptedAt = earlier;
+          throw e;
+        }
+        // no answer: it may have landed
+        if ((await lostApproval(site, p)) === "active") answer = "already";
+        else throw new RelayError(`${e.message} The approval may have gone through all the same: Anthill checks before it lets this pairing end.`);
+      } finally {
+        relay.forget(site, user.id);
+      }
+      const taken = () =>
+        new ActionError("The commons already has this agent's key, for someone else. Ask your agent to make a new key and pair again.", "key taken");
+      if (answer === "taken" || answer === "revoked") p.attemptedAt = earlier;
+      if (answer === "taken") throw taken();
+      if (answer === "revoked") {
+        throw new ActionError("This agent's key was revoked in the commons. Ask your agent to make a new key and pair again.", "key revoked");
+      }
+      // a repeat: check it really is this member's, active
+      if (answer === "already") {
+        const known = (await relay.agentsOf(site, user.id, { fresh: true })).find((a) => a.keyId === claim.keyId);
+        if (known === undefined || !known.active) throw taken();
+      }
+      pairings.end(p, "approved");
+    } finally {
+      p.relaying = false;
+    }
+    return c.json({ agent });
+  });
+
+  // Not the agent you expected (or you changed your mind): the code stops
+  // working. An approved agent is revoked instead. After an approval that got
+  // no answer, the coordinator is asked first: an agent that landed is
+  // revoked before this says rejected, and while Anthill can't tell, the
+  // pairing stays as it is.
+  route("POST", "/commons/pairings/:id/reject", async (c) => {
+    const user = signedIn(c);
+    rateLimit(`pairing-reject:${user.id}`, 30);
+    const tree = visibleTree(c, user.id);
+    const site = siteOf(tree);
+    const p = myPairing(c, user.id, tree);
+    const status = pairings.status(p);
+    if (p.relaying) throw new ActionError("This agent is being approved right now.", "approving");
+    if (status === "approved") throw new ActionError("This agent is already approved: revoke it under Your agents.", "approved");
+    if (status !== "open" && status !== "claimed") return c.json(pairingView(p));
+    if (p.attemptedAt !== undefined && p.claim !== undefined) {
+      const { agentKey } = p.claim;
+      p.relaying = true;
+      try {
+        const found = await lostApproval(site, p);
+        if (found === "unsure") {
+          throw new RelayError(
+            "Your approval may have reached the commons, and Anthill can't check that right now. Try again in a minute; if the agent shows under Your agents, revoke it there.",
+            "approval unsure",
+          );
+        }
+        if (found === "active") await revokeAgent(site, tree, user.id, agentKey, "rejected by its owner while pairing on Anthill");
+      } finally {
+        p.relaying = false;
+      }
+    }
+    pairings.end(p, "rejected");
+    return c.json(pairingView(p));
+  });
+
+  // Your agents in this commons, as its coordinator has them. Signed in, not
+  // necessarily still a member: whoever left can still see and revoke theirs,
+  // a private community's too. Someone who can't see the community and has
+  // no agent there gets the 404 anyone gets.
+  async function agentsHere(c: Context, user: string, o: { fresh?: boolean; kind?: "check" | "list" } = {}) {
+    const tree = communities.get(cidOf(c));
+    if (tree === undefined) throw new NotFoundError();
+    const site = siteOf(tree);
+    const agents = await relay.agentsOf(site, user, o);
+    if (!tree.visibleTo(user) && agents.length === 0) throw new NotFoundError();
+    return { tree, site, agents };
+  }
+
+  route("GET", "/commons/agents", async (c) => {
+    const user = signedIn(c);
+    rateLimit(`commons-agents:${user.id}`, 30);
+    const { agents } = await agentsHere(c, user.id, { kind: "list" });
+    return c.json({ agents: agents.map(agentView) });
+  });
+
+  // Revoke one of your agents (a leaked key, a misbehaving agent): Anthill
+  // signs the revocation and relays it. No recent sign-in needed: it only
+  // protects. Body: optional { reason }. A key that isn't in your (recent)
+  // list is refused without asking the coordinator again.
+  route("POST", "/commons/agents/:keyId/revoke", async (c) => {
+    const user = signedIn(c);
+    rateLimit(`commons-revoke:${user.id}`, 10);
+    const keyId = param(c, "keyId");
+    const reason = parseReason((await optionalJsonBody(c)).reason);
+    const notYours = () => new NotFoundError("You have no agent with that key in this commons.");
+    if (!/^[0-9a-f]{32}$/.test(keyId)) throw notYours();
+    const { tree, site, agents: recent } = await agentsHere(c, user.id);
+    if (!recent.some((a) => a.keyId === keyId)) throw notYours();
+    const agent = (await relay.agentsOf(site, user.id, { fresh: true })).find((a) => a.keyId === keyId);
+    if (agent === undefined) throw notYours();
+    if (!agent.active) return c.json({ agent: agentView(agent) });
+    if (agent.publicKey === undefined) {
+      throw new RelayError("The commons didn't say which key this agent has, so Anthill can't revoke it; try again later.", "no public key");
+    }
+    if ((await revokeAgent(site, tree, user.id, agent.publicKey, reason)) === "already") {
+      const now = (await relay.agentsOf(site, user.id, { fresh: true })).find((a) => a.keyId === keyId);
+      if (now === undefined || now.active) throw new RelayError("The commons didn't revoke the agent; try again in a moment.");
+      return c.json({ agent: agentView(now) });
+    }
+    return c.json({ agent: agentView({ ...agent, active: false, revokedReason: reason }) });
+  });
+
+  // Every active agent of `user`, in every commons, revoked: before the
+  // account is deleted, since nobody could revoke them on Anthill after.
+  // Any commons that can't be asked, or doesn't revoke, stops the deletion
+  // (an operator whose commons is gone for good takes it out of
+  // COMMONS_SITES).
+  async function revokeAllAgents(user: string) {
+    for (const [id, site] of commonsSites) {
+      const tree = communities.get(id);
+      if (tree === undefined) continue;
+      try {
+        for (const agent of await relay.agentsOf(site, user, { fresh: true })) {
+          if (!agent.active) continue;
+          if (agent.publicKey === undefined) throw new RelayError("the commons didn't say which key one of them has");
+          await revokeAgent(site, tree, user, agent.publicKey, "its owner deleted their Anthill account");
+        }
+      } catch (e) {
+        if (!(e instanceof RelayError) && !(e instanceof ActionError)) throw e;
+        throw new RelayError(
+          `Your agents in the ${id} agent commons couldn't be revoked (${e.message.replace(/[.:]+$/, "")}), so your account wasn't deleted. Try again in a moment.`,
+          "agents not revoked",
+        );
+      }
+    }
+  }
+
+  // What an agent reads (templates/agent.md, for this community): public to
+  // whoever can see the community, cached briefly.
+  route("GET", "/commons/agent.md", (c) => {
+    rateLimit(`agent-md:${clientIp(c)}`, 60);
+    const tree = visibleTree(c, viewerOf(c));
+    const body = renderAgentMd({ community: tree.id, backend: backendOf(c), site: siteOf(tree), kitCommit: commonsKit });
+    c.header("Content-Type", "text/markdown; charset=utf-8");
+    c.header("Cache-Control", `${tree.info.visibility === "public" ? "public" : "private"}, max-age=60`);
+    return c.body(body);
+  });
+
   app.get("/invites/:code", (c) => {
     const code = param(c, "code");
     const stored = store.invite(code);
@@ -964,11 +1397,11 @@ export function offchainServer(
     const invite = tree.validInvite(code);
     // Who holds the link sees what they need to decide: the community's name,
     // description and size, and who invited them. A private one's founder
-    // and root stay for its members.
+    // and root (and where its commons is) stay for its members.
     const viewer = viewerOf(c);
     const community = summary(tree, viewer);
     return c.json({
-      community: tree.visibleTo(viewer) ? community : { ...community, founder: null, rootName: "" },
+      community: tree.visibleTo(viewer) ? community : { ...community, founder: null, rootName: "", commons: null },
       inviter: {
         id: invite.under,
         name: store.user(invite.under)?.name ?? viewOf(tree).graph.dict[invite.under]?.name ?? "",
@@ -1039,6 +1472,15 @@ export function offchainServer(
         const detached = tree.detached();
         if (detached.length > 0) {
           console.warn(`Community ${tree.id}: ${detached.length} detached from the root:`, detached);
+        }
+      }
+      // agents and the coordinator read a commons' community without a
+      // session (agent.md, the signed tree): it must be public
+      for (const id of commonsSites.keys()) {
+        const tree = communities.get(id);
+        if (tree === undefined) console.warn(`COMMONS_SITES: no community ${id}: its commons does nothing`);
+        else if (tree.info.visibility !== "public") {
+          console.warn(`COMMONS_SITES: community ${id} is private: its agents can't read agent.md and its coordinator can't pin its tree, and Anthill refuses to pair agents there`);
         }
       }
       ready = true;

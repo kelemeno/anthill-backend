@@ -1,6 +1,7 @@
 // Checks what Anthill signs for a linked agent commons (src/commonsLink.ts),
 // no server needed: the message bytes match the commons' (the same strings
-// agent-commons pins in test/anthill.test.ts), signatures verify under the
+// agent-commons pins in test/anthill.test.ts: the tree, owner, agent,
+// agent-revoke and pair messages), signatures verify under the
 // served public key, the tree holds only members the root reaches with the
 // root under null, and the key survives a restart.
 //
@@ -11,7 +12,15 @@ import { createPublicKey, verify } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CommonsSigner, isCommonsPublicKey, ownerMessage, treeMessage } from "../src/commonsLink";
+import {
+  agentMessage,
+  agentRevokeMessage,
+  CommonsSigner,
+  isCommonsPublicKey,
+  ownerMessage,
+  pairMessage,
+  treeMessage,
+} from "../src/commonsLink";
 import { Communities } from "../src/offchain";
 import { Store } from "../src/store";
 
@@ -24,6 +33,19 @@ assert.equal(
 assert.equal(
   ownerMessage({ community: "builders", user: "0xa", publicKey: "KEY", at: "2026-01-01T00:00:00.000Z" }),
   'anthill-commons/owner/v1\n{"at":"2026-01-01T00:00:00.000Z","community":"builders","publicKey":"KEY","user":"0xa"}',
+);
+const user = `0x${"a".repeat(40)}`;
+assert.equal(
+  agentMessage({ agentKey: "KEY", at: "2026-01-01T00:00:00.000Z", community: "builders", harness: "claude-code", modelFamily: "claude", user }),
+  `anthill-commons/agent/v1\n{"agentKey":"KEY","at":"2026-01-01T00:00:00.000Z","community":"builders","harness":"claude-code","modelFamily":"claude","user":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+);
+assert.equal(
+  agentRevokeMessage({ agentKey: "KEY", at: "2026-01-01T00:00:00.000Z", community: "builders", reason: "lost", user }),
+  `anthill-commons/agent-revoke/v1\n{"agentKey":"KEY","at":"2026-01-01T00:00:00.000Z","community":"builders","reason":"lost","user":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+);
+assert.equal(
+  pairMessage({ agentKey: "KEY", code: "ABCD-EFGH-IJKL-MNOP-QRST-UVWX", community: "builders", harness: "claude-code", modelFamily: "claude" }),
+  'anthill-commons/pair/v1\n{"agentKey":"KEY","code":"ABCD-EFGH-IJKL-MNOP-QRST-UVWX","community":"builders","harness":"claude-code","modelFamily":"claude"}',
 );
 ok("message bytes match the commons'");
 
@@ -54,6 +76,15 @@ try {
   assert.ok(!isCommonsPublicKey(`${key}=`));
   assert.ok(!isCommonsPublicKey("not a key"));
   ok("owner attestations verify; only canonical ed25519 keys are vouched for");
+
+  const agent = signer.agent({ agentKey: key, at: "2026-01-01T00:00:00.000Z", community: "builders", harness: "claude-code", modelFamily: "claude", user: joiner });
+  assert.ok(check(agentMessage(agent.attestation), agent.signature));
+  const revoke = signer.agentRevoke({ agentKey: key, at: "2026-01-01T00:00:00.000Z", community: "builders", reason: "lost", user: joiner });
+  assert.ok(check(agentRevokeMessage(revoke.attestation), revoke.signature));
+  // only the message's fields are signed and handed on
+  const extra = signer.agent({ ...agent.attestation, extra: "x" } as typeof agent.attestation);
+  assert.deepEqual(Object.keys(extra.attestation).sort(), ["agentKey", "at", "community", "harness", "modelFamily", "user"]);
+  ok("agent and agent-revoke attestations verify");
 } finally {
   rmSync(dir, { recursive: true, force: true });
 }

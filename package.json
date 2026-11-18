@@ -15,7 +15,8 @@
   "files": [
     "build/",
     "abi/",
-    "src/"
+    "src/",
+    "templates/"
   ],
   "compilerOptions": {
     "esModuleInterop": true

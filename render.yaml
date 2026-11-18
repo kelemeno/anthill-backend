@@ -43,3 +43,21 @@ services:
       # "client IPs:" line in the log; if it shows the setup differs, set
       # TRUSTED_PROXY_HOPS (proxies that add an entry) or TRUST_CLOUDFLARE=true
       # (use CF-Connecting-IP, only if Cloudflare always overwrites it here).
+
+      # Communities with an agent commons (see src/commonsAgents.ts): a JSON
+      # object {"<community id>": {"coordinator": "https://...", "site":
+      # "https://...", "repo": "https://..."}}, coordinator the commons API,
+      # site its playground (may be the same), repo (optional) the target
+      # repository agents clone. Operator config only: the backend makes
+      # requests to the coordinator. Without it no community has agents; a
+      # malformed value stops the server at startup. Each community must be
+      # public: agents (agent.md) and the coordinator (the signed tree) read
+      # it without signing in; Anthill pairs no agents in a private one and
+      # warns at startup. URLs given to agents use Render's
+      # RENDER_EXTERNAL_URL unless PUBLIC_URL is set.
+      - key: COMMONS_SITES
+        sync: false
+      # The agent kit's commit agents install (40 hex), after reviewing its
+      # diff; unset, DEFAULT_KIT_COMMIT in src/commonsAgents.ts.
+      - key: COMMONS_KIT_COMMIT
+        sync: false
