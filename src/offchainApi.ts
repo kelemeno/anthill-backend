@@ -24,6 +24,7 @@ import { createGzip, gunzip } from "node:zlib";
 import type { Context, Hono } from "hono";
 import type { AnthillContractType } from "./anthillContract";
 import { PasskeyAuth } from "./auth";
+import { CommonsSigner, isCommonsPublicKey } from "./commonsLink";
 import { address0, type GraphData } from "./dagBase";
 import { type History, type HistoryNode, type HistoryStep, snapshotNodes } from "./dagHistory";
 import { loadAnthillGraph } from "./dagLoading";
@@ -320,6 +321,7 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
   });
 
   const auth = new PasskeyAuth(store);
+  const commonsSigner = new CommonsSigner(dataDir);
   const communities = new Communities(store);
   const views = new Map<string, TreeView>();
   const polls = new Map<string, Polls>();
@@ -730,6 +732,33 @@ export function offchainServer(app: Hono, broadcast: (message: string) => void) 
 
   ////////////////////////////////////////////
   //// invite links (global: the code says which community)
+
+  ////////////////////////////////////////////
+  //// an agent commons linked to a community (see commonsLink.ts)
+
+  // The key a commons records when it links to a community.
+  app.get("/commons/key", (c) => c.json({ publicKey: commonsSigner.publicKey }));
+
+  // The community's tree, signed, for the commons to pin. Who can see the
+  // community can see its tree anyway (/graph), so the same rule applies.
+  route("GET", "/commons/tree", (c) => {
+    rateLimit(`commons-tree:${clientIp(c)}`, 60);
+    const tree = visibleTree(c, viewerOf(c));
+    return c.json(commonsSigner.tree(tree, viewOf(tree).history.steps.length, new Date().toISOString()));
+  });
+
+  // A member vouches for their commons key: Anthill signs that the key is
+  // theirs, and the member hands the attestation to the commons, which admits
+  // them as an owner under their Anthill id. Only current members get one.
+  route("POST", "/commons/owner", async (c) => {
+    const user = signedIn(c);
+    rateLimit(`commons-owner:${user.id}`, 10);
+    const tree = visibleTree(c, user.id);
+    if (!tree.isMember(user.id)) throw new ActionError("only members of this community can join its commons");
+    const { publicKey } = await jsonBody(c);
+    if (!isCommonsPublicKey(publicKey)) throw new ActionError("publicKey must be an ed25519 public key (base64url SPKI DER)");
+    return c.json(commonsSigner.owner(tree.id, user.id, publicKey, new Date().toISOString()));
+  });
 
   app.get("/invites/:code", (c) => {
     const code = param(c, "code");
