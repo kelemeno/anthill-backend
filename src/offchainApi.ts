@@ -10,6 +10,10 @@
 // in it, and probing is rate limited); pick an unguessable address if even
 // that matters.
 //
+// Each community's site (which pages it shows, its accent, its About; see
+// site.ts) is set by whoever may change its settings, and seen by whoever
+// can see the community.
+//
 // Communities with an agent commons (COMMONS_SITES) also have pairing
 // routes for members' agents, their agents' list and revoke, and the agent
 // instructions page (see commonsAgents.ts); others answer 404 there.
@@ -74,6 +78,7 @@ import {
 } from "./http";
 import { NodeDataStoreCollapse, type NodeDataString } from "./nodeData";
 import { ActionError, Communities, cleanName, type Executed, type OffchainTree, parseName } from "./offchain";
+import { DEFAULT_SITE, siteSummary, siteView } from "./site";
 import { Polls, setProfile } from "./social";
 import {
   type ActionEntry,
@@ -109,6 +114,10 @@ const MAX_CHECKS = 5;
 const SIGNUPS_PER_HOUR = 100;
 // tree actions per account and day
 const ACTIONS_PER_DAY = 500;
+// saved changes to communities' settings and sites, per account and day, and
+// per community and day: each is a log entry (a site's up to ~30 KB), and the
+// log is kept for ever, replayed at every start and read by every export
+const STEWARD_SAVES_PER_DAY = 50;
 // marks that the demo's story (demoStory.ts) has been played
 const DEMO_STORY = "demo-story-1";
 // account exports per account and hour, and per client IP and hour (each
@@ -507,9 +516,11 @@ export function offchainServer(
     return site === undefined ? undefined : { coordinator: site.coordinator, site: site.site, ...(site.repo === undefined ? {} : { repo: site.repo }) };
   }
 
+  // What's logged for its site, or the defaults.
+  const storedSite = (tree: OffchainTree) => store.site(tree.id) ?? DEFAULT_SITE;
+
   function summary(tree: OffchainTree, viewer?: string) {
     const { id, name, description, visibility, joinPolicy, createdBy, createdAt } = tree.info;
-    const steward = createdBy || tree.engine.root();
     const { dict, rootId } = viewOf(tree).graph;
     // as served: not whoever the root doesn't reach (see isMember)
     const members = tree.engine.members().filter((m) => tree.isMember(m));
@@ -524,11 +535,14 @@ export function offchainServer(
       founder: createdBy === "" ? null : { id: createdBy, name: store.user(createdBy)?.name ?? "" },
       // where its agent commons is, when it has one
       commons: commonsOf(id) ?? null,
+      // its pages, accent and whether it has an About (GET /c/<id>/site has it)
+      site: siteSummary(storedSite(tree), commonsSites.has(id)),
       members: members.length,
       rootName: dict[rootId]?.name ?? "",
       isFounder: viewer !== undefined && viewer === createdBy,
-      // the founder, or the tree's root when there's none (see updateSettings)
-      canChangeSettings: viewer !== undefined && viewer === steward,
+      // the founder, or the tree's root when there's none (see
+      // OffchainTree.canChangeSettings); they also change its site
+      canChangeSettings: tree.canChangeSettings(viewer),
       // the viewer's standing, when they're a member
       you:
         me === undefined
@@ -843,13 +857,45 @@ export function offchainServer(
     return c.json({ community: summary(visibleTree(c, viewer), viewer) });
   });
 
+  // A change to a community's settings or site, `save` (true when it logged
+  // one), within STEWARD_SAVES_PER_DAY. Only a logged change counts, and the
+  // community's budget is only asked about for whoever may change it, so
+  // someone refused (or saving what's already there) takes nothing from it.
+  function stewardSave(user: string, tree: OffchainTree, save: () => boolean): boolean {
+    const day = 24 * 60 * 60_000;
+    const keys = [`steward-day:${user}`, `steward-day-c:${tree.id}`];
+    if (tree.canChangeSettings(user)) for (const key of keys) rateRoom(key, STEWARD_SAVES_PER_DAY);
+    const saved = save();
+    if (saved) for (const key of keys) rateCount(key, day);
+    return saved;
+  }
+
   // Founder only (the tree's root without one, see updateSettings): name,
   // description, visibility and join policy.
   app.post("/c/:cid/settings", async (c) => {
     const user = signedIn(c);
+    rateLimit(`settings:${user.id}`, 10);
     const tree = visibleTree(c, user.id);
     const before = updateKeyOf(tree);
-    if (communities.updateSettings(user.id, tree, await jsonBody(c))) notify([tree], before);
+    const body = await jsonBody(c);
+    if (stewardSave(user.id, tree, () => communities.updateSettings(user.id, tree, body))) notify([tree], before);
+    return c.json({ community: summary(tree, user.id) });
+  });
+
+  // The community's site, its About included: for whoever can see it.
+  app.get("/c/:cid/site", (c) => {
+    const tree = visibleTree(c, viewerOf(c));
+    return c.json({ site: siteView(storedSite(tree), commonsSites.has(tree.id)) });
+  });
+
+  // Replace the site, { pages, accent, about } (see site.ts): whoever may
+  // change the settings may (see OffchainTree.canChangeSettings).
+  app.post("/c/:cid/site", async (c) => {
+    const user = signedIn(c);
+    rateLimit(`site:${user.id}`, 10);
+    const tree = visibleTree(c, user.id);
+    const body = await jsonBody(c);
+    if (stewardSave(user.id, tree, () => communities.updateSite(user.id, tree, body, commonsSites.has(tree.id)))) notify([tree]);
     return c.json({ community: summary(tree, user.id) });
   });
 
@@ -1397,11 +1443,13 @@ export function offchainServer(
     const invite = tree.validInvite(code);
     // Who holds the link sees what they need to decide: the community's name,
     // description and size, and who invited them. A private one's founder
-    // and root (and where its commons is) stay for its members.
+    // and root (and where its commons is, and its site: the defaults show)
+    // stay for its members.
     const viewer = viewerOf(c);
     const community = summary(tree, viewer);
+    const outside = { founder: null, rootName: "", commons: null, site: siteSummary(DEFAULT_SITE, false) };
     return c.json({
-      community: tree.visibleTo(viewer) ? community : { ...community, founder: null, rootName: "", commons: null },
+      community: tree.visibleTo(viewer) ? community : { ...community, ...outside },
       inviter: {
         id: invite.under,
         name: store.user(invite.under)?.name ?? viewOf(tree).graph.dict[invite.under]?.name ?? "",

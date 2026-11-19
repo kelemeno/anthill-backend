@@ -1,7 +1,8 @@
 // Append-only log that is the off-chain source of truth. Each line of
-// <DATA_DIR>/log.jsonl is one entry: the seed graph, a community, a tree
-// action, or a change to passkeys, invites, profiles or polls. On startup the
-// engines and everything else are rebuilt by replaying the log in order.
+// <DATA_DIR>/log.jsonl is one entry: the seed graph, a community (or a change
+// to its settings or site), a tree action, or a change to passkeys, invites,
+// profiles or polls. On startup the engines and everything else are rebuilt
+// by replaying the log in order.
 //
 // Trees, invites and polls belong to a community. Entries written before
 // communities existed have no community field: they belong to the original
@@ -45,6 +46,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { AuthError } from "./auth";
 import type { SeedGraph } from "./engine";
+import { readPages, type StoredSite } from "./site";
 
 export type StoredUser = { id: string; name: string };
 
@@ -185,6 +187,10 @@ type Entry =
   | { type: "seed"; at: string; graph: SeedGraph }
   | { type: "community"; at: string; community: Stored<CommunityInfo> }
   | { type: "communityUpdate"; at: string; id: string; settings: Stored<CommunitySettings> }
+  // the community's site (see site.ts), replaced whole; `by` saved it. Its own
+  // entry type, not more settings: code from before sites skips it, so a
+  // rollback only loses the customisation
+  | { type: "communitySite"; at: string; id: string; by: string; site: StoredSite }
   | { type: "commonsMoved"; at: string; to: Stored<CommunityInfo>; commonsFounder: string }
   // a one-time change made on startup (e.g. the demo's story), so it isn't redone
   | { type: "migration"; at: string; id: string }
@@ -251,6 +257,9 @@ export class Store {
   private profiles = new Map<string, Profile>();
   private pollsById = new Map<string, Poll>();
   private communityById = new Map<string, CommunityInfo>([[DEFAULT_COMMUNITY, defaultCommunity()]]);
+  // community id -> its site, for those that saved one (it stays when whoever
+  // saved it deletes their account: it's the community's)
+  private sites = new Map<string, StoredSite>();
   private seedGraph: SeedGraph | undefined;
   // where untagged entries (the original tree) belong
   private originalTree = DEFAULT_COMMUNITY;
@@ -375,6 +384,15 @@ export class Store {
 
   community(id: string) {
     return this.communityById.get(id);
+  }
+
+  setSite(id: string, by: string, site: StoredSite) {
+    this.append({ type: "communitySite", at: now(), id, by, site });
+  }
+
+  // undefined: it never saved one (see site.ts for the defaults)
+  site(id: string) {
+    return this.sites.get(id);
   }
 
   communities() {
@@ -748,6 +766,18 @@ export class Store {
         if (c !== undefined) this.communityById.set(entry.id, { ...c, ...fromStored(entry.settings) });
         break;
       }
+      case "communitySite": {
+        // read warily: a newer version may have written more, or otherwise,
+        // and what this code can't read shows as the default (see site.ts)
+        const { pages, accent, about } = (entry.site ?? {}) as Partial<Record<keyof StoredSite, unknown>>;
+        if (!this.communityById.has(entry.id)) break;
+        this.sites.set(entry.id, {
+          pages: readPages(pages),
+          accent: typeof accent === "string" ? accent : "",
+          about: typeof about === "string" ? about : "",
+        });
+        break;
+      }
       case "passkey":
         this.users.set(entry.user.id, { ...entry.user });
         this.passkeys.set(entry.passkey.id, { ...entry.passkey });
@@ -896,6 +926,7 @@ function accountsOf(entry: Entry): string[] {
     case "action":
     case "poll":
     case "pollVote":
+    case "communitySite":
       return [entry.by];
     case "community":
       return [entry.community.createdBy];

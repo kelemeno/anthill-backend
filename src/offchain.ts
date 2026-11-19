@@ -17,6 +17,7 @@
 import { randomBytes } from "node:crypto";
 import { AnthillEngine, address0, address1, type EngineEvent, Revert, tempAddress } from "./engine";
 import { explain } from "./reasons";
+import { DEFAULT_SITE, parseSite, sameSite } from "./site";
 import {
   type Action,
   type ActionEntry,
@@ -76,6 +77,16 @@ export class OffchainTree {
     const { visibility, createdBy } = this.info;
     if (visibility === "public") return true;
     return viewer !== undefined && (viewer === createdBy || this.isMember(viewer));
+  }
+
+  // Who looks after the community's settings and its site: the founder, or
+  // without one (its founder deleted their account, or a fresh data dir's
+  // commons) its tree's root, who also closes its polls (see Polls'
+  // steward). An empty founderless tree has no root, so nobody can until
+  // someone starts it. The one place this is decided: the community's own
+  // governance may decide it one day.
+  canChangeSettings(by: string | undefined): boolean {
+    return by !== undefined && by === (this.info.createdBy || this.engine.root());
   }
 
   // In the tree and reachable from its root. The engine's isInTree is also
@@ -380,24 +391,27 @@ export class Communities {
 
   // Change a community's name, description, visibility or join policy.
   // Returns whether anything changed (unchanged settings aren't logged).
-  // The founder decides; a community without one (its founder deleted their
-  // account, or a fresh data dir's commons) is looked after by its tree's
-  // root, who also closes its polls (see Polls' steward). An empty
-  // founderless tree has no root, so nobody can until someone starts it.
+  // Who may: see OffchainTree.canChangeSettings.
   updateSettings(by: string, tree: OffchainTree, body: unknown): boolean {
-    if (by !== (tree.info.createdBy || tree.engine.root())) {
-      throw new ActionError(
-        tree.info.createdBy === ""
-          ? "Only the root of the tree can change the settings of a community without a founder."
-          : "Only the founder can change the community's settings.",
-      );
-    }
+    requireSteward(by, tree, "settings");
     const settings = parseSettings(body);
     const info = tree.info;
     if ((Object.keys(settings) as (keyof CommunitySettings)[]).every((k) => settings[k] === info[k])) {
       return false;
     }
     this.store.updateCommunity(tree.id, settings);
+    return true;
+  }
+
+  // Replace the community's site (see site.ts): who may change its settings
+  // may change it. `hasCommons`: whether it has an agent commons, which an
+  // Agents page needs. Returns whether anything changed (as above).
+  updateSite(by: string, tree: OffchainTree, body: unknown, hasCommons: boolean): boolean {
+    requireSteward(by, tree, "site");
+    const prev = this.store.site(tree.id) ?? DEFAULT_SITE;
+    const site = parseSite(body, hasCommons, prev);
+    if (sameSite(site, prev)) return false;
+    this.store.setSite(tree.id, by, site);
     return true;
   }
 
@@ -412,6 +426,15 @@ export class Communities {
       .filter((tree) => tree.isMember(user.id) && tree.engine.name(user.id) !== name)
       .map((tree) => tree.execute(user.id, { fn: "changeName", args: { name } }));
   }
+}
+
+function requireSteward(by: string, tree: OffchainTree, what: "settings" | "site") {
+  if (tree.canChangeSettings(by)) return;
+  throw new ActionError(
+    tree.info.createdBy === ""
+      ? `Only the root of the tree can change the ${what} of a community without a founder.`
+      : `Only the founder can change the community's ${what}.`,
+  );
 }
 
 function parseSettings(body: unknown): CommunitySettings {

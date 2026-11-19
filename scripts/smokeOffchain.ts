@@ -7,11 +7,11 @@
 // communities (joining, invites, privacy, settings, renaming across them, one
 // name per account, update keys, name cleaning, body limits, no-op writes,
 // poll caps and leavers' votes, an emptied tree, no agent routes without a
-// commons), adds a second passkey, recovers with the recovery code (which
-// ends old sessions and passkeys, once per code), signs out everywhere, lists
-// and ends sessions, signs out, downloads an account's data, deletes an
-// account (a founder and root with a member under them), checks CORS and the
-// security headers, and downloads the log as admin.
+// commons, the site), adds a second passkey, recovers with the recovery code
+// (which ends old sessions and passkeys, once per code), signs out
+// everywhere, lists and ends sessions, signs out, downloads an account's
+// data, deletes an account (a founder and root with a member under them),
+// checks CORS and the security headers, and downloads the log as admin.
 //
 //   PORT=5098 DATA_DIR=/tmp/anthill-smoke ADMIN_TOKEN=smoke-admin npx tsx src/App.ts
 //   BACKEND=http://localhost:5098/ ADMIN_TOKEN=smoke-admin npx tsx scripts/smokeOffchain.ts
@@ -373,6 +373,24 @@ async function main() {
   ] as const) {
     assert.equal((await call(path, body, session.token)).status, 404, path);
   }
+  // its site: the defaults (no Agents page without a commons), the founder's
+  // to change (see scripts/siteChecks.ts)
+  assert.deepEqual(pub.data.community.site, {
+    pages: { explore: true, polls: true, people: true, agents: false },
+    accent: "indigo",
+    hasAbout: false,
+  });
+  const clubSite = {
+    pages: { explore: true, polls: false, people: true, agents: false },
+    accent: "teal",
+    about: "# Smoke Club\n\nWe test.",
+  };
+  assert.equal((await call("c/smoke-public/site", clubSite, friend.token)).status, 400);
+  assert.equal((await call("c/smoke-public/site", { ...clubSite, pages: { ...clubSite.pages, agents: true } }, session.token)).status, 400);
+  const savedSite = await call("c/smoke-public/site", clubSite, session.token);
+  assert.equal(savedSite.status, 200, JSON.stringify(savedSite.data));
+  assert.deepEqual(savedSite.data.community.site, { pages: clubSite.pages, accent: "teal", hasAbout: true });
+  assert.deepEqual((await call("c/smoke-public/site")).data.site, clubSite);
   for (const id of ["smoke-public", "A!", "admin", "-x-"]) {
     const bad = await call(
       "communities",

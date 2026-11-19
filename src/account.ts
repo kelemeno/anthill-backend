@@ -5,10 +5,10 @@
 // actions (its own, and others' endorsements and moves that name it), polls,
 // votes (each with its poll's question, options and community, and the
 // result once it closed: what members see anyway), invites, sign-ins,
-// renames. Secrets stay out (passkeys' public keys,
-// the recovery code's hash), and so does anything that is only about other
-// people. The Google email isn't in the log (see store.ts): it comes from
-// the side file, with the linked Google account.
+// renames, the community sites it saved. Secrets stay out (passkeys' public
+// keys, the recovery code's hash), and so does anything that is only about
+// other people. The Google email isn't in the log (see store.ts): it comes
+// from the side file, with the linked Google account.
 
 import type { LogEntry, Poll, Store } from "./store";
 
@@ -46,6 +46,8 @@ function aboutUser(
       return entry;
     case "communityUpdate":
       return mine.has(`community:${entry.id}`) ? entry : undefined;
+    case "communitySite":
+      return entry.by === userId ? entry : undefined;
     case "commonsMoved":
       if (entry.commonsFounder !== userId) return undefined;
       mine.add("community:commons");
