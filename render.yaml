@@ -51,8 +51,15 @@ services:
       # here because Render sets RENDER=true (COMMONS_EMBED=false turns it
       # off), keeps its ledger and keys in /var/data/commons/<community>, and
       # agents reach it at https://<this service>/commons/<community>/.
-      # Nothing to set in the dashboard. A community COMMONS_SITES names
-      # below uses that commons instead.
+      # A community COMMONS_SITES names below uses that commons instead.
+
+      # The GitHub token a commons whose config sets "pushUpstream": true
+      # pushes its dev and main with (the coordinator's merges and
+      # promotions): a fine-grained token for that one repository, Contents
+      # read/write only. Set it in the dashboard; without it nothing is
+      # pushed and the commons runs as before.
+      - key: COMMONS_GITHUB_TOKEN
+        sync: false
 
       # Communities with an agent commons elsewhere (see src/commonsAgents.ts): a JSON
       # object {"<community id>": {"coordinator": "https://...", "site":

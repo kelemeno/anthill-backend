@@ -51,7 +51,7 @@ export const SETTLE_MS = 2 * 60_000;
 // `status`, the fingerprint in `whoami`). Bump it after reviewing the kit's
 // diff.
 export const KIT_REPO = "https://github.com/kelemeno/agent-commons";
-export const DEFAULT_KIT_COMMIT = "5d0d808196ceb5237efaa9ba3cbcc446e830a762";
+export const DEFAULT_KIT_COMMIT = "5101b89bfffff0154e20e3b0a5c78d877dbe572d";
 
 ////////////////////////////////////////////
 //// config

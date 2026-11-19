@@ -43,7 +43,12 @@
 //   SIGTERM or SIGINT stops it (its process group: git too) before the
 //   backend exits. Its output goes to the backend's log, each line prefixed
 //   "[commons <community>]". Its environment has only PATH, HOME, the
-//   locale and temp variables, none of the backend's.
+//   locale and temp variables, none of the backend's, plus, for a commons
+//   whose config sets "pushUpstream": true, COMMONS_GITHUB_TOKEN when the
+//   backend has it: the one secret a child gets, which agent-commons hands
+//   to git through git's environment (never argv or the log) to push the
+//   clone's dev and main to the target on GitHub after merges and
+//   promotions (its --push-upstream).
 // - Advertised (community summaries, agent.md, the Agents page and the
 //   relay, see offchainApi.ts) only once it has been set up: its ledger is
 //   on the disk. Before that (setting up, or never started) the community
@@ -57,12 +62,16 @@
 //   SESSION_SECRET isn't set: it forges a session for any account),
 //   $DATA_DIR/commons-signing-key (Anthill's commons signing key), rewrite
 //   $DATA_DIR/log.jsonl, and read the backend's environment
-//   (/proc/<pid>/environ: ADMIN_TOKEN, GOOGLE_CLIENT_SECRET). A compromised
-//   coordinator is a compromised backend.
+//   (/proc/<pid>/environ: ADMIN_TOKEN, GOOGLE_CLIENT_SECRET, and
+//   COMMONS_GITHUB_TOKEN, which can write to the target repository). A
+//   compromised coordinator is a compromised backend: keep that token a
+//   fine-grained one for the one repository (Contents read/write, no
+//   Workflows, no admin), and protect the target's main from force pushes.
 // - What it runs here, in Phase 1: no repository code. Findings aren't
 //   reproduced without --sandbox and merges are git merge-tree; git runs
-//   with hooks, fsmonitor and LFS filters off, and the clone uses no
-//   credentials (agent-commons' README, Hosting). Real stakes, or test runs
+//   with hooks, fsmonitor and LFS filters off, and the clone fetches with no
+//   credentials; only the mirror's pushes carry the token, when it's on
+//   (agent-commons' README, Hosting). Real stakes, or test runs
 //   of strangers' code, move it to its own service (or the runs to CI),
 //   which is also what makes it a boundary: its own disk and user.
 
@@ -121,6 +130,10 @@ export type EmbeddedCommons = {
   internalUrl: string;
   // agent-commons' --test-allow-file-target (local tests only)
   allowFileTarget: boolean;
+  // push the clone's dev and main to the target on GitHub after merges and
+  // promotions (agent-commons' --push-upstream), with COMMONS_GITHUB_TOKEN:
+  // set in the config, and on only while that token is in the environment
+  pushUpstream: boolean;
 };
 
 export type Embed = {
@@ -142,7 +155,7 @@ const PRESET = /^[a-z0-9][a-z0-9-]{0,31}$/;
 // preset, `--check` doesn't judge it: an unknown one would stop the child at
 // every start, so it's refused here.
 export const RULES_PRESETS = ["phase1", "solo"] as const;
-const FIELDS = new Set(["target", "kernelSigners", "preset", "port", "rulesPreset"]);
+const FIELDS = new Set(["target", "kernelSigners", "preset", "port", "rulesPreset", "pushUpstream"]);
 
 // The backend's public address (as offchainApi.ts gives agents): PUBLIC_URL,
 // else the one Render gives the service.
@@ -189,7 +202,7 @@ function targetUrl(v: unknown, where: string, allowFile: boolean): string {
   return v;
 }
 
-type Entry = { target?: unknown; kernelSigners?: unknown; preset?: unknown; port?: unknown; rulesPreset?: unknown };
+type Entry = { target?: unknown; kernelSigners?: unknown; preset?: unknown; port?: unknown; rulesPreset?: unknown; pushUpstream?: unknown };
 
 function entries(text: string, where: string): Map<string, Entry> {
   let parsed: unknown;
@@ -258,6 +271,15 @@ export function readEmbed(o: {
     if (typeof e.port !== "number" || !Number.isInteger(e.port) || e.port < 1024 || e.port > 65535) throw new Error(`${where("port")} must be a port from 1024 to 65535`);
     if (ports.has(e.port)) throw new Error(`${where("port")}: ${e.port} is already the backend's or another commons' port`);
     ports.add(e.port);
+    if (e.pushUpstream !== undefined && typeof e.pushUpstream !== "boolean") throw new Error(`${where("pushUpstream")} must be true or false (or left out)`);
+    let pushUpstream = false;
+    if (e.pushUpstream === true) {
+      if (!/^https:\/\/github\.com\/[^/]+\/[^/]+$/.test(target.replace(/\.git$/, "")) && !target.startsWith("file:")) {
+        throw new Error(`${where("pushUpstream")}: pushing needs a target on https://github.com/<owner>/<repo>`);
+      }
+      if (env.COMMONS_GITHUB_TOKEN?.trim()) pushUpstream = true;
+      else notes.push(`${community}: pushUpstream is set but COMMONS_GITHUB_TOKEN isn't, so its dev and main stay in its own clone`);
+    }
     if (o.sites?.has(community)) {
       notes.push(`${community}: COMMONS_SITES names it, so its commons is the one there and none runs here`);
       continue;
@@ -274,6 +296,7 @@ export function readEmbed(o: {
       publicUrl: `${backend}${basePath}`,
       internalUrl: `http://127.0.0.1:${e.port}${basePath}`,
       allowFileTarget: allowFile,
+      pushUpstream,
     });
   }
   // absolute: the child runs in its own folder
@@ -364,6 +387,9 @@ export function childSpec(c: EmbeddedCommons, embed: Embed, rt: Runtime, env: No
   const data = childDataDir(c, embed);
   const childEnv: NodeJS.ProcessEnv = {};
   for (const name of CHILD_ENV) if (env[name] !== undefined) childEnv[name] = env[name];
+  // the one secret a child gets, and only one that pushes (the token, never
+  // in argv or the log: agent-commons hands it to git through git's env)
+  if (c.pushUpstream && env.COMMONS_GITHUB_TOKEN?.trim()) childEnv.COMMONS_GITHUB_TOKEN = env.COMMONS_GITHUB_TOKEN.trim();
   return {
     command: rt.node,
     args: [
@@ -383,6 +409,7 @@ export function childSpec(c: EmbeddedCommons, embed: Embed, rt: Runtime, env: No
       "--embedded",
       "--loop-seconds", "30",
       ...(c.allowFileTarget ? ["--test-allow-file-target"] : []),
+      ...(c.pushUpstream ? ["--push-upstream"] : []),
     ],
     cwd: data,
     env: childEnv,

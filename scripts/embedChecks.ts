@@ -139,7 +139,9 @@ async function main() {
 
     // the committed config, on Render
     const onRender = e.readEmbed({ env: { RENDER: "true", RENDER_EXTERNAL_URL: "https://anthill-backend.onrender.com/", DATA_DIR: "/var/data" }, port: 10000 });
-    assert.deepEqual(onRender.notes, []);
+    // builders pushes to GitHub once the token is there; without it, says so
+    assert.deepEqual(onRender.notes, ["builders: pushUpstream is set but COMMONS_GITHUB_TOKEN isn't, so its dev and main stay in its own clone"]);
+    assert.equal(e.readEmbed({ env: { RENDER: "true", COMMONS_GITHUB_TOKEN: "t" }, port: 10000 }).embed!.communities[0].pushUpstream, true);
     const embed = onRender.embed!;
     assert.equal(embed.commit, PIN);
     assert.equal(embed.dataDir, "/var/data");
@@ -155,6 +157,7 @@ async function main() {
         publicUrl: "https://anthill-backend.onrender.com/commons/builders",
         internalUrl: "http://127.0.0.1:5101/commons/builders",
         allowFileTarget: false,
+        pushUpstream: false,
       },
     ]);
     // PUBLIC_URL first; locally, this machine
@@ -167,6 +170,33 @@ async function main() {
     const named = e.readEmbed({ env: { RENDER: "true" }, port: 10000, sites: new Set(["builders"]) });
     assert.deepEqual(named.embed!.communities, []);
     assert.match(named.notes.join("\n"), /builders: COMMONS_SITES names it/);
+
+    // pushing to GitHub: set in the config, on only with the token, which
+    // reaches only that child, through its environment, never its argv
+    {
+      const cfg = (extra: object) => JSON.stringify({ builders: { target: "https://github.com/kelemeno/agent-commons", kernelSigners: [KALMAN], preset: "solo", port: 5101, ...extra } });
+      const pkg = readFileSync(join(__dirname, "..", "package.json"), "utf8");
+      const read = (extra: object, env: NodeJS.ProcessEnv) => e.readEmbed({ env: { RENDER: "true", ...env }, port: 10000, configText: cfg(extra), packageText: pkg });
+      const off = read({ pushUpstream: true }, {});
+      assert.equal(off.embed!.communities[0].pushUpstream, false);
+      assert.match(off.notes.join("\n"), /pushUpstream is set but COMMONS_GITHUB_TOKEN isn't/);
+      const token = "github_pat_test_0123456789";
+      const on = read({ pushUpstream: true }, { COMMONS_GITHUB_TOKEN: ` ${token}\n` });
+      assert.equal(on.embed!.communities[0].pushUpstream, true);
+      const fakeRt = { node: "node", tsx: "tsx", cli: "cli" } as Parameters<typeof e.childSpec>[2];
+      const pushing = e.childSpec(on.embed!.communities[0], on.embed!, fakeRt, { PATH: "/bin", COMMONS_GITHUB_TOKEN: token, ADMIN_TOKEN: "x" });
+      assert.ok(pushing.args.includes("--push-upstream"));
+      assert.equal(pushing.env.COMMONS_GITHUB_TOKEN, token);
+      assert.equal(pushing.env.ADMIN_TOKEN, undefined);
+      assert.ok(!pushing.args.join(" ").includes(token), "the token is never in argv");
+      // a commons that doesn't push never gets it
+      const quiet = read({}, { COMMONS_GITHUB_TOKEN: token });
+      const plain = e.childSpec(quiet.embed!.communities[0], quiet.embed!, fakeRt, { PATH: "/bin", COMMONS_GITHUB_TOKEN: token });
+      assert.equal(plain.env.COMMONS_GITHUB_TOKEN, undefined);
+      assert.ok(!plain.args.includes("--push-upstream"));
+      assert.throws(() => read({ pushUpstream: "yes" }, {}), /pushUpstream must be true or false/);
+      assert.throws(() => read({ pushUpstream: true, target: "https://gitlab.com/a/b" }, { COMMONS_GITHUB_TOKEN: token }), /needs a target on https:\/\/github.com/);
+    }
 
     // overrides, off Render only
     const override = JSON.stringify({ builders: { target: "file:///tmp/target", preset: "phase1", kernelSigners: [`0x${"b".repeat(40)}`], port: 5999 } });
@@ -248,9 +278,11 @@ async function main() {
     assert.ok(server.includes('e === "loopback"'), "the pinned commons trusts loopback as a proxy");
     const help = spawnSync(rt.node, ["--import", rt.tsx, rt.cli, "host", "--help"], { encoding: "utf8" });
     assert.equal(help.status, 0, help.stderr);
-    const spec = e.childSpec({ ...(e.readEmbed({ env: { RENDER: "true" }, port: 10000 }).embed!.communities[0]), allowFileTarget: true, rulesPreset: "solo" }, { communities: [], commit: PIN, dataDir: "/d", anthillUrl: "http://127.0.0.1:1" }, rt);
+    // every flag the backend may pass, pushing included: one the pin doesn't
+    // take stops the child before it starts (exit 2, "unknown flag")
+    const spec = e.childSpec({ ...(e.readEmbed({ env: { RENDER: "true" }, port: 10000 }).embed!.communities[0]), allowFileTarget: true, rulesPreset: "solo", pushUpstream: true }, { communities: [], commit: PIN, dataDir: "/d", anthillUrl: "http://127.0.0.1:1" }, rt);
     const flags = e.checkSpec(spec).args.filter((a) => a.startsWith("--") && a !== "--import");
-    for (const flag of ["--embedded", "--rules-preset"]) assert.ok(flags.includes(flag), flag);
+    for (const flag of ["--embedded", "--rules-preset", "--push-upstream"]) assert.ok(flags.includes(flag), flag);
     for (const flag of flags) assert.ok(help.stdout.includes(`  ${flag} `) || help.stdout.includes(`  ${flag}\n`), `commons host takes ${flag}`);
     assert.deepEqual(e.checkSpec(spec).args.slice(0, 5), ["--import", rt.tsx, rt.cli, "host", "--check"]);
 
@@ -448,6 +480,7 @@ async function main() {
       publicUrl: "http://localhost/commons/builders",
       internalUrl: `http://127.0.0.1:${childPort}/commons/builders`,
       allowFileTarget: false,
+      pushUpstream: false,
     };
     type Seen = { method: string; url: string; headers: http.IncomingHttpHeaders; bytes: number; firstChunkAt: number; endAt: number };
     const seen: Seen[] = [];
