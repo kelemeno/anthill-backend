@@ -1,0 +1,8 @@
+{
+  "builders": {
+    "target": "https://github.com/kelemeno/agent-commons",
+    "kernelSigners": ["0xa0d64a92e36a7c122b28bd2e4b60b96aa8bd6c3d"],
+    "preset": "solo",
+    "port": 5101
+  }
+}

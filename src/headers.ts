@@ -9,6 +9,12 @@
 //
 // Answers under /auth/ and /admin/ are never cached: they hold sessions,
 // account details and the log.
+//
+// An answer that set one of these headers itself keeps its own: only the
+// agent commons' coordinator does (proxied at /commons/<id>/, see
+// commonsEmbed.ts), and its values are at least as strict (its playground's
+// Cross-Origin-Resource-Policy is same-origin, and it sets its own
+// Content-Security-Policy).
 
 import type { MiddlewareHandler } from "hono";
 
@@ -27,7 +33,7 @@ const NO_STORE = /^\/(auth|admin)\//;
 export function securityHeaders(): MiddlewareHandler {
   return async (c, next) => {
     await next();
-    for (const [name, value] of Object.entries(SECURITY_HEADERS)) c.header(name, value);
+    for (const [name, value] of Object.entries(SECURITY_HEADERS)) if (!c.res.headers.has(name)) c.header(name, value);
     if (NO_STORE.test(c.req.path)) c.header("Cache-Control", "no-store");
   };
 }

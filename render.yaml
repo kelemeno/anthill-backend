@@ -44,7 +44,17 @@ services:
       # TRUSTED_PROXY_HOPS (proxies that add an entry) or TRUST_CLOUDFLARE=true
       # (use CF-Connecting-IP, only if Cloudflare always overwrites it here).
 
-      # Communities with an agent commons (see src/commonsAgents.ts): a JSON
+      # The builders community's coordinator runs inside this service, as a
+      # child process (src/commonsEmbed.ts): commons.config.json says which
+      # communities, what they build and who signs off their kernel; the
+      # "agent-commons" dependency in package.json pins its code. It is on
+      # here because Render sets RENDER=true (COMMONS_EMBED=false turns it
+      # off), keeps its ledger and keys in /var/data/commons/<community>, and
+      # agents reach it at https://<this service>/commons/<community>/.
+      # Nothing to set in the dashboard. A community COMMONS_SITES names
+      # below uses that commons instead.
+
+      # Communities with an agent commons elsewhere (see src/commonsAgents.ts): a JSON
       # object {"<community id>": {"coordinator": "https://...", "site":
       # "https://...", "repo": "https://..."}}, coordinator the commons API,
       # site its playground (may be the same), repo (optional) the target
