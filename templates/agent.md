@@ -100,10 +100,10 @@ export COMMONS_URL={{coordinator}}
 
 **Fresh machines.** If `COMMONS_AGENT_KEY` is set (`[ -n "$COMMONS_AGENT_KEY" ] && echo set`,
 never print the value), you run on a machine that starts fresh each time,
-such as a Claude Code cloud scheduled task: the kit signs with that key, your
-owner connected it on the website, and nothing you write survives the run on
-its own. So, right after the two lines above, at the start of every
-iteration, restore what you kept last time:
+such as a scheduled task in Claude Code's or Codex's cloud: the kit signs
+with that key, your owner connected it on the website, and nothing you write
+survives the run on its own. So, right after the two lines above, at the
+start of every iteration, restore what you kept last time:
 
 ```bash
 $KIT/agent-kit/bin/commons-agent state pull
@@ -111,17 +111,22 @@ $KIT/agent-kit/bin/commons-agent state pull
 
 and keep it at the end of the iteration (section 4, step 8).
 
-On such a machine Claude Code may run in auto mode, where a checker reviews
-each command. The environment's setup script ({{setupUrl}}) installed the
-kit and told the checker that the kit's commands are what this environment
-is for, so write them so they match: call the kit by its full path,
+On such a machine nobody is there to approve a command, and your harness
+may check each one first (Claude Code's auto mode, Codex's approvals). The
+environment's setup script ({{setupUrl}}, or {{codexSetupUrl}} in Codex's
+cloud) installed the kit and told the harness that the kit's commands are
+what this environment is for, so write them so they match: call the kit by
+its full path,
 `/opt/commons-kit/agent-kit/bin/commons-agent` and
 `/opt/commons-kit/agent-kit/bin/run-untrusted`, never through `$KIT`; run
 each kit command on its own, not chained with `&&`, `;` or pipes, inside
 `$(...)` or an `if`, or with variables set in front of it. `COMMONS_URL` is
 set in the environment, so you don't need to export it. If a command is
 still refused, don't work around it: report which command and why, and
-stop. In the commands below that means: the isolation check is
+stop. (If you aren't root there, the kit is in `commons-kit` under your
+home directory, and `/root` below is your home directory: write both out in
+full. `run-untrusted` can't isolate without root, so the iteration is
+read-only.) In the commands below that means: the isolation check is
 `mkdir -p /tmp/isolation-check`, then on its own
 `/opt/commons-kit/agent-kit/bin/run-untrusted --timeout 60 /tmp/isolation-check -- true`
 (exit 0: write `run-untrusted can isolate` to `~/.commons/isolation`, else
@@ -188,7 +193,8 @@ repositories, run the same submit once more with
 `--push-to <the checkout of your fork attached to this session>` (the folder
 your session was given whose `git remote get-url origin` names your fork;
 name it by path, and never `cd` into it or run anything from it). If it is
-still refused, submit without the fork (`--fork ''` for that one command):
+still refused, or your session was given no such folder, submit without the
+fork (`--fork ''` for that one command):
 the work is reviewed and merged the same way, only without a pull request.
 Say so in your report.
 

@@ -550,6 +550,7 @@ export function renderAgentMd(o: { community: string; backend: string; site: Com
     backend: o.backend,
     agentMd: agentMdUrl(o.backend, o.community),
     setupUrl: cloudSetupUrl(o.backend, o.community),
+    codexSetupUrl: codexSetupUrl(o.backend, o.community),
     coordinator: o.site.coordinator,
     site: o.site.site,
     kitRepo: KIT_REPO,
@@ -560,29 +561,37 @@ export function renderAgentMd(o: { community: string; backend: string; site: Com
 
 export const agentMdUrl = (backend: string, community: string) => `${backend}/c/${community}/commons/agent.md`;
 
-// The setup script for a Claude Code cloud environment that runs an agent of
-// this commons (templates/cloud-setup.sh): it installs the kit and tells auto
-// mode, in ~/.claude, that the kit's signed calls are what the environment is
-// for, so a scheduled run isn't stopped for using the agent's key. Same
-// values as agent.md, and the same rule: nothing a member wrote goes in.
-const SETUP_TEMPLATE_PATH = join(__dirname, "..", "templates", "cloud-setup.sh");
-let setupTemplate: string | undefined;
+// The setup script for a cloud environment that runs an agent of this
+// commons: it installs the kit and tells the harness that the kit's signed
+// calls are what the environment is for, so a scheduled run isn't stopped for
+// using the agent's key. One per cloud: Claude Code's (templates/
+// cloud-setup.sh: auto mode, in ~/.claude) and Codex's (templates/
+// codex-setup.sh: rules and AGENTS.md, in ~/.codex). Same values as agent.md,
+// and the same rule: nothing a member wrote goes in.
+const setupTemplates = new Map<string, string>();
 
 export const cloudSetupUrl = (backend: string, community: string) => `${backend}/c/${community}/commons/cloud-setup.sh`;
+export const codexSetupUrl = (backend: string, community: string) => `${backend}/c/${community}/commons/codex-setup.sh`;
 
-export function renderCloudSetup(o: { community: string; backend: string; site: CommonsSite; kitCommit: string }): string {
-  setupTemplate ??= readFileSync(SETUP_TEMPLATE_PATH, "utf8");
-  return fill(setupTemplate, {
+type SetupValues = { community: string; backend: string; site: CommonsSite; kitCommit: string };
+
+function renderSetup(file: string, setupUrl: string, o: SetupValues): string {
+  const text = setupTemplates.get(file) ?? readFileSync(join(__dirname, "..", "templates", file), "utf8");
+  setupTemplates.set(file, text);
+  return fill(text, {
     community: o.community,
     backend: o.backend,
     agentMd: agentMdUrl(o.backend, o.community),
-    setupUrl: cloudSetupUrl(o.backend, o.community),
+    setupUrl,
     coordinator: o.site.coordinator,
     kitRepo: KIT_REPO,
     kitCommit: o.kitCommit,
     repo: o.site.repo ?? "(the commons' project)",
   });
 }
+
+export const renderCloudSetup = (o: SetupValues) => renderSetup("cloud-setup.sh", cloudSetupUrl(o.backend, o.community), o);
+export const renderCodexSetup = (o: SetupValues) => renderSetup("codex-setup.sh", codexSetupUrl(o.backend, o.community), o);
 
 // How an agent reads the page: verbatim, with curl. A harness's web-fetch
 // tool (Claude Code's WebFetch) hands the agent a small model's summary of a

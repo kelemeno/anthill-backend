@@ -18,7 +18,8 @@
 // instructions page (the iteration's order, proposing work when there's
 // nothing else, claiming only a task whose tests exist, one of an owner's
 // agents writing a spec, and its ledger summary run against a fake
-// coordinator); 404s for a community without a commons; the agent's
+// coordinator); the cloud setup scripts, Claude Code's and Codex's (that one
+// run in a home of its own); 404s for a community without a commons; the agent's
 // routes limited per IP; nothing about pairings in the log; and deleting an
 // account revokes its agents first.
 //
@@ -1045,6 +1046,83 @@ async function main() {
     expect(await call("/c/plain/commons/cloud-setup.sh"), 404);
   }
   ok("the cloud setup script is rendered for the community, pinned like agent.md");
+
+  {
+    // the same for a Codex cloud environment: the kit pinned as agent.md pins
+    // it, and ~/.codex told about this commons only
+    const res = await call("/c/builders/commons/codex-setup.sh");
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("Content-Type") ?? "", /^text\/x-shellscript/);
+    const sh = res.text;
+    assert.ok(!sh.includes("{{"), "every placeholder filled");
+    assert.ok(!sh.includes("Builders"), "nothing a founder wrote");
+    const md = (await call("/c/builders/commons/agent.md")).text;
+    const pin = /KIT_COMMIT=([0-9a-f]{40})/;
+    assert.equal(sh.match(pin)?.[1], md.match(pin)?.[1]);
+    assert.ok(sh.includes(`curl -fsSL ${BACKEND}/c/builders/commons/codex-setup.sh | bash`), "says how it's run");
+    assert.ok(!sh.includes("$COMMONS_AGENT_KEY") && !sh.includes("${COMMONS_AGENT_KEY"), "never reads the key");
+    // nothing of Claude Code's, and no blanket switch-off of Codex's approvals
+    assert.ok(!sh.includes(".claude") && !sh.includes("approval_policy") && !sh.includes("sandbox_mode"));
+    assert.ok(md.includes(`${BACKEND}/c/builders/commons/codex-setup.sh`), "agent.md names it");
+    assert.ok(!md.includes("Claude Code may run in auto mode"), "agent.md's fresh machines aren't Claude Code's only");
+
+    // Run for real in a home of its own, with a git and an npm that fail (no
+    // network here): the kit is left for the run, ~/.codex is still written.
+    const { execFileSync } = await import("node:child_process");
+    const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    execFileSync("bash", ["-n"], { input: sh });
+    const home = mkdtempSync(join(tmpdir(), "codex-setup-"));
+    try {
+      const stubs = join(home, "stubs");
+      mkdirSync(stubs);
+      for (const name of ["git", "npm"]) writeFileSync(join(stubs, name), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+      mkdirSync(join(home, ".codex"));
+      writeFileSync(join(home, ".codex", "AGENTS.md"), "Mine.\n");
+      const { spawnSync } = await import("node:child_process");
+      const run = () =>
+        spawnSync("bash", [], {
+          input: sh,
+          env: { HOME: home, PATH: `${stubs}:${process.env.PATH}`, COMMONS_AGENT_KEY: "the-key" },
+          encoding: "utf8",
+        });
+      const first = run();
+      assert.equal(first.status, 0, first.stderr);
+      assert.match(first.stdout, /commons agent environment ready/);
+      run(); // twice: its block is replaced, not added again
+      // (this check doesn't run as root: the kit's place is under the home)
+      const bin = `${home}/commons-kit/agent-kit/bin`;
+      // an install that failed says so and isn't marked done
+      assert.match(first.stderr, /commons kit: install failed/);
+      assert.ok(!existsSync(`${home}/commons-kit/.kit-commit`));
+      const agentsMd = readFileSync(join(home, ".codex", "AGENTS.md"), "utf8");
+      assert.ok(agentsMd.startsWith("Mine.\n"), "what was there stays");
+      assert.equal(agentsMd.split("# This environment runs an Anthill commons agent").length, 2);
+      for (const needed of [
+        "the user's own AI agent in the\n`builders` agent commons",
+        `curl -fsSL ${BACKEND}/c/builders/commons/agent.md`,
+        `\`${bin}/commons-agent\``,
+        "never print it or\nyour environment",
+      ]) {
+        assert.ok(agentsMd.includes(needed), `AGENTS.md has ${JSON.stringify(needed)}`);
+      }
+      // only the kit's two commands are allowed without asking
+      assert.deepEqual(readdirSync(join(home, ".codex", "rules")), ["anthill-commons.rules"]);
+      const rules = readFileSync(join(home, ".codex", "rules", "anthill-commons.rules"), "utf8");
+      assert.deepEqual(
+        [...rules.matchAll(/pattern = (\[.*\]),/g)].map((m) => JSON.parse(m[1])),
+        [[`${bin}/commons-agent`], [`${bin}/run-untrusted`]],
+      );
+      assert.equal(rules.match(/decision = "allow"/g)?.length, 2);
+      for (const written of [agentsMd, rules]) assert.ok(!written.includes("the-key") && !written.includes("@KIT@"));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+    expect(await call("/c/hidden/commons/codex-setup.sh"), 404);
+    expect(await call("/c/plain/commons/codex-setup.sh"), 404);
+  }
+  ok("the Codex setup script is rendered for the community, pinned like agent.md, and writes ~/.codex");
 
   ////////////////////////////////////////////
   //// communities without a commons
