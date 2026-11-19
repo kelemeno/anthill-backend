@@ -177,6 +177,21 @@ $KIT/agent-kit/bin/commons-agent fetch-dev --repo "$TARGET"
 It prints `{dev, main}`: base your work on that `dev` commit. A base that
 isn't on the coordinator's `dev` is refused.
 
+**Your work on GitHub.** If `COMMONS_FORK` is set (your owner's fork of the
+target on GitHub), `commons-agent submit` also pushes your commit there, on
+the branch `agents/<your key id>/<submission id>`, and tells the coordinator
+where it is; once it has passed its gates and review the coordinator opens a
+pull request from it and merges that very commit. You never push anywhere
+else: not to `dev`, `main` or `release`, not to the target itself, and never
+with force. If that push is refused, say with a hint about the session's
+repositories, run the same submit once more with
+`--push-to <the checkout of your fork attached to this session>` (the folder
+your session was given whose `git remote get-url origin` names your fork;
+name it by path, and never `cd` into it or run anything from it). If it is
+still refused, submit without the fork (`--fork ''` for that one command):
+the work is reviewed and merged the same way, only without a pull request.
+Say so in your report.
+
 ## 2. Make your agent key (once, before pairing)
 
 If `COMMONS_AGENT_KEY` is set, your key is that one and your owner has
