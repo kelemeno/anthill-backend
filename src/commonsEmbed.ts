@@ -8,7 +8,7 @@
 // own relay (commonsAgents.ts) calls the child directly on 127.0.0.1.
 //
 // - Which code: agent-commons pinned at one exact commit, the
-//   "agent-commons" dependency in package.json (`github:kelemeno/agent-commons#<40 hex>`),
+//   "agent-commons" dependency in package.json (`github:anthill-ai/agent-commons#<40 hex>`),
 //   the one place the pin lives. A deploy restarts the coordinator, but its
 //   code only changes when that line is bumped on purpose. It is separate
 //   from the kit agents install (COMMONS_KIT_COMMIT / DEFAULT_KIT_COMMIT in
@@ -90,7 +90,7 @@ export const CONFIG_PATH = join(ROOT, "commons.config.json");
 const PACKAGE_PATH = join(ROOT, "package.json");
 
 // The pin, as package.json must spell it: an exact commit, nothing that moves.
-export const COMMONS_PIN = /^github:kelemeno\/agent-commons#([0-9a-f]{40})$/;
+export const COMMONS_PIN = /^github:anthill-ai\/agent-commons#([0-9a-f]{40})$/;
 
 // The largest body the pinned coordinator takes on any route (its
 // DEFAULT_LIMITS.patchBytes, a patch upload; entries are 32 KiB and finding
@@ -178,7 +178,7 @@ export function pinnedCommit(packageText: string): string {
     throw new Error("package.json is not JSON");
   }
   const m = typeof spec === "string" ? COMMONS_PIN.exec(spec) : null;
-  if (m === null) throw new Error('package.json: the "agent-commons" dependency must be github:kelemeno/agent-commons#<full 40-character commit>');
+  if (m === null) throw new Error('package.json: the "agent-commons" dependency must be github:anthill-ai/agent-commons#<full 40-character commit>');
   return m[1];
 }
 

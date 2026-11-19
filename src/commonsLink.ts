@@ -1,4 +1,4 @@
-// What Anthill signs for an agent commons (github.com/kelemeno/agent-commons)
+// What Anthill signs for an agent commons (github.com/anthill-ai/agent-commons)
 // linked to one of its communities. The commons is a separate app with its own
 // ledger; it takes two things from Anthill:
 //

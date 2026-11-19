@@ -149,7 +149,7 @@ async function main() {
     assert.deepEqual(embed.communities, [
       {
         community: "builders",
-        target: "https://github.com/kelemeno/agent-commons",
+        target: "https://github.com/anthill-ai/agent-commons",
         kernelSigners: [KALMAN],
         preset: "solo",
         port: 5101,
@@ -174,7 +174,7 @@ async function main() {
     // pushing to GitHub: set in the config, on only with the token, which
     // reaches only that child, through its environment, never its argv
     {
-      const cfg = (extra: object) => JSON.stringify({ builders: { target: "https://github.com/kelemeno/agent-commons", kernelSigners: [KALMAN], preset: "solo", port: 5101, ...extra } });
+      const cfg = (extra: object) => JSON.stringify({ builders: { target: "https://github.com/anthill-ai/agent-commons", kernelSigners: [KALMAN], preset: "solo", port: 5101, ...extra } });
       const pkg = readFileSync(join(__dirname, "..", "package.json"), "utf8");
       const read = (extra: object, env: NodeJS.ProcessEnv) => e.readEmbed({ env: { RENDER: "true", ...env }, port: 10000, configText: cfg(extra), packageText: pkg });
       const off = read({ pushUpstream: true }, {});
@@ -240,8 +240,8 @@ async function main() {
     refused({ builders: { ...good, port: 5001 } }, /already the backend's/);
     refused({ builders: good, others: { ...good } }, /already the backend's or another/);
     refused({ builders: good }, /isn't in commons.config.json/, { COMMONS_EMBED: "true", COMMONS_EMBED_OVERRIDE: JSON.stringify({ other: { preset: "x" } }) });
-    assert.throws(() => e.pinnedCommit(JSON.stringify({ dependencies: { "agent-commons": "github:kelemeno/agent-commons#main" } })), /full 40-character commit/);
-    assert.throws(() => e.pinnedCommit(JSON.stringify({ dependencies: { "agent-commons": "github:kelemeno/agent-commons" } })), /full 40-character commit/);
+    assert.throws(() => e.pinnedCommit(JSON.stringify({ dependencies: { "agent-commons": "github:anthill-ai/agent-commons#main" } })), /full 40-character commit/);
+    assert.throws(() => e.pinnedCommit(JSON.stringify({ dependencies: { "agent-commons": "github:anthill-ai/agent-commons" } })), /full 40-character commit/);
     assert.throws(() => e.pinnedCommit(JSON.stringify({ dependencies: {} })), /full 40-character commit/);
     assert.ok(configText.length > 0);
 
@@ -337,7 +337,7 @@ async function main() {
       "--public-url", "https://b.onrender.com/commons/builders",
       "--anthill-url", "http://127.0.0.1:10000",
       "--community", "builders",
-      "--target-repo", "https://github.com/kelemeno/agent-commons",
+      "--target-repo", "https://github.com/anthill-ai/agent-commons",
       "--kernel-signer", KALMAN,
       "--preset", "solo",
       "--embedded",
