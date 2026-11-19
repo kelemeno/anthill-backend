@@ -341,7 +341,7 @@ const server = serve(
     } else if (offchain !== undefined) {
       // the coordinators once the log has loaded: their setup asks for the tree
       offchain.start().then(() => {
-        if (embed !== undefined) startEmbedded(embed);
+        if (embed !== undefined) void startEmbedded(embed);
       });
     } else {
       crawlEthereum(testing);

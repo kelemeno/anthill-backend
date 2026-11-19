@@ -49,7 +49,7 @@ import {
   renderAgentMd,
   SETTLE_MS,
 } from "./commonsAgents";
-import { type Embed, mountCommonsProxy } from "./commonsEmbed";
+import { type Embed, mountCommonsProxy, setUpCheck } from "./commonsEmbed";
 import { CommonsSigner, isCommonsPublicKey, verifyPairProof } from "./commonsLink";
 import { address0, address1, type GraphData } from "./dagBase";
 import { type History, type HistoryNode, type HistoryStep, snapshotNodes } from "./dagHistory";
@@ -381,13 +381,33 @@ export function offchainServer(
   const google = new GoogleSignIn(keySecret, options.google);
   const commonsSigner = new CommonsSigner(dataDir);
   // read now: a mistake in either stops the server here, not on a request
-  const commonsSites = parseCommonsSites(process.env.COMMONS_SITES);
+  const operatorSites = parseCommonsSites(process.env.COMMONS_SITES);
   // the ones this backend runs (COMMONS_SITES wins for a community it names):
-  // agents and the website get the public URLs, the relay calls the child
+  // agents and the website get the public URLs, the relay calls the child.
+  // Each only once its coordinator is set up (its ledger is there): before
+  // that, or if it never starts, the community has no commons, not one that
+  // always answers 503 (see commonsEmbed.ts).
+  const embeddedSites = new Map<string, { site: CommonsSite; setUp: () => boolean }>();
   for (const e of options.embed?.communities ?? []) {
-    if (commonsSites.has(e.community)) continue;
-    commonsSites.set(e.community, { coordinator: e.publicUrl, site: `${e.publicUrl}/`, repo: e.target, internal: e.internalUrl });
+    if (operatorSites.has(e.community)) continue;
+    embeddedSites.set(e.community, {
+      site: { coordinator: e.publicUrl, site: `${e.publicUrl}/`, repo: e.target, internal: e.internalUrl },
+      setUp: setUpCheck(e, options.embed!),
+    });
   }
+  const commonsSites = {
+    get(id: string): CommonsSite | undefined {
+      const own = embeddedSites.get(id);
+      return operatorSites.get(id) ?? (own?.setUp() ? own.site : undefined);
+    },
+    entries(): [string, CommonsSite][] {
+      const out = [...operatorSites];
+      for (const [id, own] of embeddedSites) if (own.setUp()) out.push([id, own.site]);
+      return out;
+    },
+    // every configured one, set up or not
+    ids: () => [...operatorSites.keys(), ...embeddedSites.keys()],
+  };
   if (options.embed !== undefined) mountCommonsProxy(app, options.embed.communities, clientIp);
   const commonsKit = kitCommit();
   const pairings = new Pairings();
@@ -1369,7 +1389,7 @@ export function offchainServer(
   // (an operator whose commons is gone for good takes it out of
   // COMMONS_SITES).
   async function revokeAllAgents(user: string) {
-    for (const [id, site] of commonsSites) {
+    for (const [id, site] of commonsSites.entries()) {
       const tree = communities.get(id);
       if (tree === undefined) continue;
       try {
@@ -1486,7 +1506,7 @@ export function offchainServer(
       }
       // agents and the coordinator read a commons' community without a
       // session (agent.md, the signed tree): it must be public
-      for (const id of commonsSites.keys()) {
+      for (const id of commonsSites.ids()) {
         const tree = communities.get(id);
         if (tree === undefined) console.warn(`Agent commons: no community ${id}: its commons does nothing`);
         else if (tree.info.visibility !== "public") {

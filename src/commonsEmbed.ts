@@ -21,8 +21,10 @@
 // - Config is code: commons.config.json, `{ "<community>": { "target":
 //   "https://...", "kernelSigners": ["0x..."], "preset": "...", "port":
 //   5101 } }`. The preset is passed as it is: the pinned commons decides
-//   which names it knows (a name it doesn't know stops the child, which is
-//   restarted with backoff, until a pin that knows it). For local tests,
+//   which names it knows. Before starting a child the backend asks the
+//   pinned commons (`commons host --check`, same flags) whether it can start:
+//   one it can't (a preset the pin doesn't know yet, on a fresh disk) isn't
+//   started, and that is logged, until a deploy that fixes it. For local tests,
 //   off Render, COMMONS_EMBED_OVERRIDE (the same JSON, any fields, for
 //   communities the file names) changes it, and
 //   COMMONS_EMBED_TEST_FILE_TARGET=true lets a target be a file: URL
@@ -33,21 +35,39 @@
 //   10 minutes up); nothing about it can stop the backend. The backend's
 //   SIGTERM or SIGINT stops it (its process group: git too) before the
 //   backend exits. Its output goes to the backend's log, each line prefixed
-//   "[commons <community>]". It gets only PATH, HOME, the locale and temp
-//   variables from the environment, none of the backend's secrets.
+//   "[commons <community>]". Its environment has only PATH, HOME, the
+//   locale and temp variables, none of the backend's.
+// - Advertised (community summaries, agent.md, the Agents page and the
+//   relay, see offchainApi.ts) only once it has been set up: its ledger is
+//   on the disk. Before that (setting up, or never started) the community
+//   has no commons, rather than one that always answers 503. Once set up it
+//   stays advertised, down or not: agents there must stay revocable.
+// - Not an isolation boundary. The child runs as the backend's own OS user,
+//   on the same disk: a clean environment keeps the backend's secrets out of
+//   its environment, nothing more. Code running in it (a bug in the
+//   coordinator, tsx or git, exploited by an entry, a patch or a playground
+//   request) can read $DATA_DIR/session-secret (the session key, when
+//   SESSION_SECRET isn't set: it forges a session for any account),
+//   $DATA_DIR/commons-signing-key (Anthill's commons signing key), rewrite
+//   $DATA_DIR/log.jsonl, and read the backend's environment
+//   (/proc/<pid>/environ: ADMIN_TOKEN, GOOGLE_CLIENT_SECRET). A compromised
+//   coordinator is a compromised backend.
 // - What it runs here, in Phase 1: no repository code. Findings aren't
 //   reproduced without --sandbox and merges are git merge-tree; git runs
 //   with hooks, fsmonitor and LFS filters off, and the clone uses no
 //   credentials (agent-commons' README, Hosting). Real stakes, or test runs
-//   of strangers' code, move it to its own service (or the runs to CI).
+//   of strangers' code, move it to its own service (or the runs to CI),
+//   which is also what makes it a boundary: its own disk and user.
 
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { isIP } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import type { Context, Hono, MiddlewareHandler } from "hono";
+import { isLoopback } from "./http";
 
 const ROOT = join(__dirname, "..");
 export const CONFIG_PATH = join(ROOT, "commons.config.json");
@@ -298,7 +318,21 @@ export function commonsRuntime(commit: string): { runtime?: Runtime; problems: s
 
 export type ChildSpec = { command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv };
 
-// only these reach the child: none of the backend's secrets
+// A community's folder, and its ledger: there once the coordinator is set up.
+export const childDataDir = (c: EmbeddedCommons, embed: Embed) => join(embed.dataDir, "commons", c.community);
+export const ledgerOf = (c: EmbeddedCommons, embed: Embed) => join(childDataDir(c, embed), "commons-ledger.jsonl");
+
+// Whether the coordinator has been set up (its ledger is there): until then
+// Anthill doesn't advertise it. Once true, true for good (a ledger isn't
+// taken away while the backend runs).
+export function setUpCheck(c: EmbeddedCommons, embed: Embed): () => boolean {
+  const ledger = ledgerOf(c, embed);
+  let seen = false;
+  return () => (seen ||= existsSync(ledger));
+}
+
+// Only these reach the child's environment: none of the backend's secrets
+// there. (Not isolation: the child is the same OS user, see the top.)
 const CHILD_ENV = ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "COMMONS_DEBUG"];
 
 // `commons host` for one community: it sets itself up on its first start
@@ -307,7 +341,7 @@ const CHILD_ENV = ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
 // its base path, with a coordinator pass every 30 seconds. Without
 // --hold-on-failure it exits 2 when it can't go on, and is restarted.
 export function childSpec(c: EmbeddedCommons, embed: Embed, rt: Runtime, env: NodeJS.ProcessEnv = process.env): ChildSpec {
-  const data = join(embed.dataDir, "commons", c.community);
+  const data = childDataDir(c, embed);
   const childEnv: NodeJS.ProcessEnv = {};
   for (const name of CHILD_ENV) if (env[name] !== undefined) childEnv[name] = env[name];
   return {
@@ -472,11 +506,50 @@ export class Supervisor {
   }
 }
 
+// The same command with --check: `commons host` then only says whether it
+// can start (0: its ledger is there, or the setup settings are valid; 1:
+// some are missing; 2: one is invalid, a preset the pin doesn't know, say),
+// printing why, and touches nothing.
+export function checkSpec(spec: ChildSpec): ChildSpec {
+  const at = spec.args.indexOf("host");
+  return { ...spec, args: [...spec.args.slice(0, at + 1), "--check", ...spec.args.slice(at + 1)] };
+}
+
+const CHECK_TIMEOUT_MS = 60_000;
+
+// Runs the check: whether the child can start, and what it printed.
+function canStart(spec: ChildSpec): Promise<{ ok: boolean; why: string }> {
+  return new Promise((resolve) => {
+    let out = "";
+    let child: ChildProcess;
+    try {
+      child = spawn(spec.command, checkSpec(spec).args, { cwd: spec.cwd, env: spec.env, stdio: ["ignore", "pipe", "pipe"], timeout: CHECK_TIMEOUT_MS });
+    } catch (e) {
+      resolve({ ok: false, why: `could not run the check: ${(e as Error).message}` });
+      return;
+    }
+    const add = (d: Buffer) => {
+      if (out.length < MAX_LOG_LINE) out += d.toString("utf8");
+    };
+    child.stdout?.on("data", add);
+    child.stderr?.on("data", add);
+    child.on("error", (e) => resolve({ ok: false, why: `could not run the check: ${e.message}` }));
+    child.on("close", (code, signal) => {
+      const said = out.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "").trim().split("\n").filter((l) => l.trim() !== "").join("; ").slice(0, MAX_LOG_LINE);
+      resolve({ ok: code === 0, why: said || (signal !== null ? `stopped by ${signal}` : `exit code ${code}`) });
+    });
+  });
+}
+
 // Starts a supervised child per community (after the backend's log has
-// loaded), and stops them when the backend is told to stop. Returns them,
-// none if what the children need is missing (that is logged, and the
-// backend runs on without them).
-export function startEmbedded(embed: Embed, o: { runtime?: Runtime; env?: NodeJS.ProcessEnv; supervisor?: SupervisorOptions; shutdown?: boolean } = {}): Supervisor[] {
+// loaded), and stops them when the backend is told to stop. Returns them:
+// none if what the children need is missing, and none for a community
+// whose child the pinned commons says can't start (both logged; the backend
+// runs on without them, and doesn't advertise a commons never set up).
+export async function startEmbedded(
+  embed: Embed,
+  o: { runtime?: Runtime; env?: NodeJS.ProcessEnv; supervisor?: SupervisorOptions; shutdown?: boolean } = {},
+): Promise<Supervisor[]> {
   if (embed.communities.length === 0) return [];
   let rt = o.runtime;
   if (rt === undefined) {
@@ -494,6 +567,14 @@ export function startEmbedded(embed: Embed, o: { runtime?: Runtime; env?: NodeJS
       const spec = childSpec(c, embed, rt, o.env);
       mkdirSync(spec.cwd, { recursive: true, mode: 0o700 });
       chmodSync(spec.cwd, 0o700);
+      const check = await canStart(spec);
+      if (!check.ok) {
+        console.error(
+          `Agent commons ${c.community}: not starting its coordinator: agent-commons ${embed.commit.slice(0, 12)} says it can't start (${check.why}).`,
+          "Its community has no commons until a deploy fixes commons.config.json or the pin.",
+        );
+        continue;
+      }
       console.log(
         `Agent commons ${c.community}: coordinator at agent-commons ${embed.commit.slice(0, 12)}, serving ${c.publicUrl} (127.0.0.1:${c.port}),`,
         `building ${c.target} with preset ${c.preset}, data in ${spec.cwd}`,
@@ -548,6 +629,14 @@ const DROP_REQUEST = new Set([
 ]);
 const DROP_RESPONSE = new Set(["connection", "keep-alive", "transfer-encoding", "trailer", "upgrade", "set-cookie", "content-encoding"]);
 
+// The address the child is given for a client the backend can't place: one
+// that isn't an IP (clientIp falls back to "local"), loopback, which the
+// child trusts as its proxy and would charge to the socket's 127.0.0.1,
+// Anthill's own relay's address, or unspecified. (TEST-NET-1: never a real
+// client.) All of them share its limits there.
+export const UNPLACED_CLIENT = "192.0.2.1";
+export const forwardedFor = (ip: string) => (isIP(ip) === 0 || isLoopback(ip) || /^(0\.0\.0\.0|::|::ffff:0\.0\.0\.0)$/i.test(ip) ? UNPLACED_CLIENT : ip);
+
 const tooLarge = (c: Context) => c.json({ error: "too-large", message: `body exceeds ${MAX_PROXY_BODY} bytes` }, 413);
 
 // https://<backend>/commons/<community>/... to the child, the full path
@@ -556,7 +645,8 @@ const tooLarge = (c: Context) => c.json({ error: "too-large", message: `body exc
 // security headers added where it set none, see headers.ts), redirects
 // passed back as they are. X-Forwarded-For is the one address the backend
 // takes for the client (http.ts: clientIp), so the child, trusting only
-// loopback as its proxy, limits each client by it. A child that isn't up
+// loopback as its proxy, limits each client by it; never a loopback one
+// (see UNPLACED_CLIENT), so no client is counted as Anthill's relay. A child that isn't up
 // (starting, restarting) is a 503.
 export function mountCommonsProxy(
   app: Hono,
@@ -574,7 +664,7 @@ export function mountCommonsProxy(
           headers.set(name, value);
         }
       });
-      headers.set("x-forwarded-for", clientIp(c));
+      headers.set("x-forwarded-for", forwardedFor(clientIp(c)));
       headers.set("accept-encoding", "identity");
       const method = c.req.method;
       const declared = c.req.header("content-length");

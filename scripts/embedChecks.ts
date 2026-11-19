@@ -6,24 +6,28 @@
 // - the pin: package.json names one exact commit, npm installed that one,
 //   tsx and git are there, and the pinned source still has what this relies
 //   on (its largest body is the proxy's cap, `commons host` takes every flag
-//   passed, loopback as a trusted proxy); whether it knows the config's
-//   preset yet is reported, not required (a later pin bump makes it valid);
+//   passed, loopback as a trusted proxy); a community the pinned commons
+//   says can't start (`commons host --check`: a preset it doesn't know yet)
+//   is never started, nor advertised;
 // - the child's command line and environment (no backend secrets);
+// - the one-time "client IPs:" log line isn't used up by the child's own
+//   calls to the backend on 127.0.0.1;
 // - the supervisor: log prefix, restarts with backoff, a spawn that fails,
 //   stop (SIGTERM, SIGKILL after the grace, the whole process group);
 // - the proxy, against a fake coordinator: the full path, bodies streamed
 //   both ways and bigger than the backend's 64 KB (up to the coordinator's
 //   own largest, then a 413), X-Forwarded-For as the backend reads the
-//   client, no sessions or cookies passed on, the coordinator's own headers
+//   client (never a loopback address, which the child would count as
+//   Anthill's relay), no sessions or cookies passed on, the coordinator's own headers
 //   with the backend's security headers where it set none, redirects passed
 //   back, a 503 while the child is down, the backend's own limits unchanged
 //   elsewhere;
 // - end to end with the pinned commons itself (skip with --no-e2e): a
 //   backend on a fresh data dir with a public builders community, its
 //   coordinator set up from a local target repository (the test-only file:
-//   flag) with the founder as kernel signer, serving through the proxy (the
-//   API's head, the playground and its script), the community summary's
-//   public URLs, an Agents pairing whose approval is relayed to the child on
+//   flag) with the founder as kernel signer, no commons advertised before
+//   it's set up, serving through the proxy (the API's head, the playground
+//   and its script), the community summary's public URLs, an Agents pairing whose approval is relayed to the child on
 //   127.0.0.1 and lands in its ledger, and the child stopped at the end.
 //
 //   npx tsx scripts/embedChecks.ts [--no-e2e] [--verbose]   (--verbose: the child's log)
@@ -84,6 +88,35 @@ async function main() {
   const e = await import("../src/commonsEmbed");
   const { clientIp } = await import("../src/http");
   const { corsPolicy, securityHeaders } = await import("../src/headers");
+
+  ////////////////////////////////////////////
+  //// the one-time "client IPs:" line (first: nothing has called clientIp yet)
+
+  {
+    const logged: string[] = [];
+    const log = console.log;
+    console.log = (...args: unknown[]) => void logged.push(args.join(" "));
+    const req = (remoteAddress: string, headers: Record<string, string>) => ({
+      req: { header: (name: string) => headers[name] },
+      env: { incoming: { socket: { remoteAddress } } },
+    });
+    try {
+      // the child's tree fetch: from 127.0.0.1, nothing forwarded
+      assert.equal(clientIp(req("127.0.0.1", {})), "127.0.0.1");
+      assert.equal(clientIp(req("::ffff:127.0.0.1", {})), "::ffff:127.0.0.1");
+      assert.equal(clientIp(req("::1", {})), "::1");
+      assert.deepEqual(logged, [], "a loopback call with nothing forwarded doesn't use up the line");
+      // the first request through Render's proxy does
+      assert.equal(clientIp(req("10.0.0.5", { "x-forwarded-for": "198.51.100.7" })), "198.51.100.7");
+      assert.equal(logged.length, 1);
+      assert.match(logged[0], /^client IPs: 1 X-Forwarded-For entries on the first proxied request \(0 Cloudflare's on the right\), CF-Connecting-IP absent; using 1 from the right$/);
+      clientIp(req("10.0.0.5", { "x-forwarded-for": "198.51.100.8" }));
+      assert.equal(logged.length, 1, "once");
+    } finally {
+      console.log = log;
+    }
+  }
+  ok('the "client IPs:" line is about the first proxied request, not the child\'s own loopback calls');
 
   ////////////////////////////////////////////
   //// config
@@ -205,14 +238,8 @@ async function main() {
     const help = spawnSync(rt.node, ["--import", rt.tsx, rt.cli, "host", "--help"], { encoding: "utf8" });
     assert.equal(help.status, 0, help.stderr);
     const spec = e.childSpec({ ...(e.readEmbed({ env: { RENDER: "true" }, port: 10000 }).embed!.communities[0]), allowFileTarget: true }, { communities: [], commit: PIN, dataDir: "/d", anthillUrl: "http://127.0.0.1:1" }, rt);
-    for (const flag of spec.args.filter((a) => a.startsWith("--") && a !== "--import")) assert.ok(help.stdout.includes(`  ${flag} `) || help.stdout.includes(`  ${flag}\n`), `commons host takes ${flag}`);
-    // which presets it knows: the config's may need a later pin
-    const presets = /--preset <value>\s+setup: ([^(]+)\(/.exec(help.stdout)?.[1] ?? "";
-    for (const c of e.readEmbed({ env: { RENDER: "true" }, port: 10000 }).embed!.communities) {
-      if (!new RegExp(`\\b${c.preset}\\b`).test(presets)) {
-        note(`the pinned agent-commons (${PIN.slice(0, 12)}) doesn't know preset "${c.preset}" (${c.community}) yet: its child will exit 2 and be restarted with backoff until a pin that knows it`);
-      }
-    }
+    for (const flag of e.checkSpec(spec).args.filter((a) => a.startsWith("--") && a !== "--import")) assert.ok(help.stdout.includes(`  ${flag} `) || help.stdout.includes(`  ${flag}\n`), `commons host takes ${flag}`);
+    assert.deepEqual(e.checkSpec(spec).args.slice(0, 5), ["--import", rt.tsx, rt.cli, "host", "--check"]);
   }
   ok("package.json pins one commit, npm installed it, tsx and git are there, the pinned source has what the proxy and the child rely on");
 
@@ -323,6 +350,51 @@ async function main() {
   ok("the supervisor: prefixed log lines, restarts with backoff, a command that can't run retried, stop takes the whole group (SIGKILL after the grace)");
 
   ////////////////////////////////////////////
+  //// what the pinned commons can't start is neither started nor advertised
+
+  {
+    const quiet = async <T>(f: () => Promise<T>): Promise<{ value: T; errors: string[] }> => {
+      const errors: string[] = [];
+      const [err, log, warn] = [console.error, console.log, console.warn];
+      console.error = (...args: unknown[]) => void errors.push(args.join(" "));
+      console.log = () => {};
+      console.warn = () => {};
+      try {
+        return { value: await f(), errors };
+      } finally {
+        [console.error, console.log, console.warn] = [err, log, warn];
+      }
+    };
+    const committed = e.readEmbed({ env: { RENDER: "true" }, port: 10000 }).embed!;
+    // a preset no pin knows: not started, said why, nothing written
+    {
+      const dataDir = join(scratch, "refused-data");
+      const embed = { ...committed, dataDir, communities: committed.communities.map((c) => ({ ...c, preset: "nonesuch" })) };
+      const { value, errors } = await quiet(() => e.startEmbedded(embed, { runtime: rt, shutdown: false }));
+      assert.deepEqual(value, [], "not started");
+      assert.match(errors.join("\n"), /Agent commons builders: not starting its coordinator: agent-commons [0-9a-f]{12} says it can't start \(.*--preset/);
+      assert.equal(e.setUpCheck(embed.communities[0], embed)(), false, "never set up, so never advertised");
+      assert.ok(!existsSync(e.ledgerOf(embed.communities[0], embed)));
+    }
+    // the committed config: whatever the pin can't start is refused the same way
+    for (const c of committed.communities) {
+      const dataDir = join(scratch, `committed-${c.community}`);
+      mkdirSync(join(dataDir, "commons", c.community), { recursive: true });
+      const embed = { ...committed, dataDir, communities: [c] };
+      const spec = e.childSpec(c, embed, rt);
+      const check = spawnSync(spec.command, e.checkSpec(spec).args, { cwd: spec.cwd, env: spec.env, encoding: "utf8" });
+      if (check.status === 0) continue;
+      const why = `${check.stdout}${check.stderr}`.trim();
+      const { value, errors } = await quiet(() => e.startEmbedded(embed, { runtime: rt, shutdown: false }));
+      assert.deepEqual(value, [], `${c.community}: the pinned commons can't start it (${why}), so it isn't started`);
+      assert.match(errors.join("\n"), new RegExp(`Agent commons ${c.community}: not starting its coordinator`));
+      assert.equal(e.setUpCheck(c, embed)(), false);
+      note(`${c.community}: agent-commons ${PIN.slice(0, 12)} can't start it (${why}): it isn't started and its community has no commons until a pin that can`);
+    }
+  }
+  ok("a coordinator the pinned commons says can't start (commons host --check) isn't started, and with no ledger isn't advertised");
+
+  ////////////////////////////////////////////
   //// the proxy, against a fake coordinator
 
   {
@@ -400,6 +472,25 @@ async function main() {
     assert.equal(seen[0].headers.cookie, undefined);
     assert.equal(seen[0].headers["x-real-ip"], undefined);
     assert.equal(seen[0].headers["x-commons-key"], "k");
+    // never an address the child takes for its proxy (it would count the
+    // client as 127.0.0.1, Anthill's own relay)
+    for (const [forwarded, expected] of [
+      ["127.0.0.1", e.UNPLACED_CLIENT],
+      ["6.6.6.6, ::1", e.UNPLACED_CLIENT],
+      ["::ffff:127.0.0.2", e.UNPLACED_CLIENT],
+      ["0.0.0.0", e.UNPLACED_CLIENT],
+      ["not-an-ip", e.UNPLACED_CLIENT],
+      ["2001:db8::7", "2001:db8::7"],
+      ["::ffff:198.51.100.3", "::ffff:198.51.100.3"],
+    ]) {
+      seen.length = 0;
+      await (await fetch(at("/commons/builders/api/head"), { headers: { "X-Forwarded-For": forwarded } })).arrayBuffer();
+      assert.equal(seen[0].headers["x-forwarded-for"], expected, forwarded);
+    }
+    // nothing forwarded: the backend reads the socket, 127.0.0.1 here
+    seen.length = 0;
+    await (await fetch(at("/commons/builders/api/head"))).arrayBuffer();
+    assert.equal(seen[0].headers["x-forwarded-for"], e.UNPLACED_CLIENT);
     assert.equal(res.headers.get("content-type"), "application/json; charset=utf-8");
     assert.equal(res.headers.get("cache-control"), "no-store");
     assert.equal(res.headers.get("x-content-type-options"), "nosniff");
@@ -486,7 +577,7 @@ async function main() {
     assert.equal((await res.json()).error, "unavailable");
     backend.close();
   }
-  ok("the proxy: full path, bodies streamed both ways and past 64 KB up to the coordinator's largest, X-Forwarded-For as the backend reads it, no sessions or cookies, the coordinator's headers kept with the backend's added, redirects, 503 while it's down");
+  ok("the proxy: full path, bodies streamed both ways and past 64 KB up to the coordinator's largest, X-Forwarded-For as the backend reads it (never loopback), no sessions or cookies, the coordinator's headers kept with the backend's added, redirects, 503 while it's down");
 
   ////////////////////////////////////////////
   //// end to end, with the pinned commons
@@ -495,7 +586,7 @@ async function main() {
     note("skipped the end-to-end run (--no-e2e)");
   } else {
     await endToEnd(e, rt, scratch);
-    ok("end to end: the pinned commons sets itself up from a local target, serves its API and playground through the proxy, the summary has the public URLs, and an approved pairing is relayed to it on 127.0.0.1 and lands in its ledger");
+    ok("end to end: nothing advertised before setup; the pinned commons sets itself up from a local target, serves its API and playground through the proxy, the summary has the public URLs, and an approved pairing is relayed to it on 127.0.0.1 and lands in its ledger");
   }
   rmSync(scratch, { recursive: true, force: true });
   console.log("all embed checks passed");
@@ -592,10 +683,14 @@ async function endToEnd(e: typeof import("../src/commonsEmbed"), rt: import("../
   expect(await call("/communities", { id: "builders", name: "Builders", visibility: "public", joinPolicy: "open" }, founder.token), 200);
   builders.kernelSigners = [founder.user.id];
 
-  // before the child is up, the proxy answers 503
+  // before the child is up, the proxy answers 503, and the community has no
+  // commons yet: nothing advertised that can't be reached
   expect(await call("/commons/builders/api/head"), 503);
+  assert.equal(expect(await call("/c/builders"), 200).community.commons, null);
+  expect(await call("/c/builders/commons/agent.md"), 404);
+  expect(await call("/c/builders/commons/pairings", { modelFamily: "claude", harness: "claude-code" }, founder.token), 404);
   const lines: string[] = [];
-  const [supervisor] = e.startEmbedded(embed, { runtime: rt, shutdown: false, supervisor: { log: (line) => (process.argv.includes("--verbose") ? console.log(line) : lines.push(line)) } });
+  const [supervisor] = await e.startEmbedded(embed, { runtime: rt, shutdown: false, supervisor: { log: (line) => (process.argv.includes("--verbose") ? console.log(line) : lines.push(line)) } });
   try {
     const head = await until("the coordinator's head through the proxy", 120_000, async () => {
       const r = await call("/commons/builders/api/head");

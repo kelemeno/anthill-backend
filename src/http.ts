@@ -125,17 +125,32 @@ export function clientIp(c: ConnReq) {
   let edge = all.length;
   while (edge > 0 && isCloudflare(all[edge - 1])) edge--;
   const forwarded = all.slice(0, edge);
-  if (!loggedShape) {
-    // once, to check the proxy setup in the logs (no addresses)
+  const incoming = (c.env as { incoming?: IncomingMessage } | undefined)?.incoming;
+  const socket = incoming?.socket.remoteAddress;
+  const cf = c.req.header("cf-connecting-ip");
+  // Once, to check the proxy setup in the logs (no addresses): the first
+  // request that may have come through a proxy. A call from this machine
+  // with nothing forwarded (an agent commons coordinator this backend runs,
+  // fetching a tree; see commonsEmbed.ts) says nothing about the proxy, so
+  // it doesn't use the line up.
+  if (!loggedShape && !(all.length === 0 && cf === undefined && socket !== undefined && isLoopback(socket))) {
     loggedShape = true;
     console.log(
-      `client IPs: ${all.length} X-Forwarded-For entries on the first request (${all.length - edge} Cloudflare's on the right),`,
-      `CF-Connecting-IP ${c.req.header("cf-connecting-ip") === undefined ? "absent" : "present"}; using ${PROXY_HOPS} from the right`,
+      `client IPs: ${all.length} X-Forwarded-For entries on the first proxied request (${all.length - edge} Cloudflare's on the right),`,
+      `CF-Connecting-IP ${cf === undefined ? "absent" : "present"}; using ${PROXY_HOPS} from the right`,
     );
   }
   if (PROXY_HOPS > 0 && forwarded.length >= PROXY_HOPS) return forwarded[forwarded.length - PROXY_HOPS];
-  const incoming = (c.env as { incoming?: IncomingMessage } | undefined)?.incoming;
-  return incoming?.socket.remoteAddress ?? "local";
+  return socket ?? "local";
+}
+
+// 127.0.0.0/8 and ::1, as an address or an IPv4-mapped one (::ffff:127.0.0.1).
+const LOOPBACK6 = new BlockList();
+LOOPBACK6.addAddress("::1", "ipv6");
+export function isLoopback(ip: string) {
+  const v4 = ip.toLowerCase().startsWith("::ffff:") && isIPv4(ip.slice(7)) ? ip.slice(7) : ip;
+  if (isIPv4(v4)) return v4.startsWith("127.");
+  return isIPv6(ip) && LOOPBACK6.check(ip, "ipv6");
 }
 
 export function requireAdmin(c: Req) {
