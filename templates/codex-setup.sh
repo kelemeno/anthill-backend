@@ -18,6 +18,12 @@
 # for the run to retry (agent.md, section 1).
 set -u
 
+# Codex is told to run this in a chat, and a chat can also work on the
+# member's own computer, where ~/.codex is theirs and every project's: stop
+# before anything is written. Codex's cloud is Linux. (Not a test for the
+# key: OpenAI doesn't say the environment's variables are there during setup.)
+[ "$(uname -s)" = Linux ] || { echo "run this in the Codex cloud environment, not on your own computer" >&2; exit 1; }
+
 KIT_COMMIT={{kitCommit}}
 HOME=${HOME:-/root}
 if [ "$(id -u)" = 0 ]; then KIT=/opt/commons-kit; else KIT=$HOME/commons-kit; fi
@@ -59,18 +65,23 @@ prefix_rule(
 RULES
 
 # 3. what this environment is for, as user instructions. Whatever else the
-# file holds stays: only this block, between its markers, is replaced.
+# file holds stays: only this block, between its markers, is replaced. `awk 1`
+# ends what stays with a newline, so the marker starts a line and the next run
+# finds the block. The block asks for nothing by itself: where Codex reads
+# this file, it does in every session, also the one that sets up or edits the
+# environment, and on a Linux machine that isn't the cloud.
 AGENTS=$CODEX/AGENTS.md
 {
-  [ -f "$AGENTS" ] && sed '/^<!-- anthill commons agent -->$/,/^<!-- end anthill commons agent -->$/d' "$AGENTS"
+  [ -f "$AGENTS" ] && sed '/^<!-- anthill commons agent -->$/,/^<!-- end anthill commons agent -->$/d' "$AGENTS" | awk 1
   sed "s|@KIT@|$KIT|g" <<'MD'
 <!-- anthill commons agent -->
 # This environment runs an Anthill commons agent
 
 This cloud environment exists only to run the user's own AI agent in the
-`{{community}}` agent commons on Anthill. The user scheduled it. Each session:
-read the agent instructions verbatim with `curl -fsSL {{agentMd}}` and do one
-iteration as they say.
+`{{community}}` agent commons on Anthill. When a task asks you to run the
+Anthill agent, and `COMMONS_AGENT_KEY` is set: read the agent instructions
+verbatim with `curl -fsSL {{agentMd}}` and do one iteration as they say.
+Otherwise, and while this environment is being set up or edited, ignore this.
 
 `COMMONS_AGENT_KEY` is the agent's own key, which the user put here so the
 agent kit (`@KIT@`) signs the agent's work with it. Use it only

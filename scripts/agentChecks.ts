@@ -1068,25 +1068,33 @@ async function main() {
 
     // Run for real in a home of its own, with a git and an npm that fail (no
     // network here): the kit is left for the run, ~/.codex is still written.
-    const { execFileSync } = await import("node:child_process");
+    // The script only runs on Linux, as Codex's cloud is, so `uname` is a stub
+    // too: this check runs on a developer's machine.
+    const { execFileSync, spawnSync } = await import("node:child_process");
     const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     execFileSync("bash", ["-n"], { input: sh });
-    const home = mkdtempSync(join(tmpdir(), "codex-setup-"));
-    try {
+    // a home with the member's own ~/.codex/AGENTS.md, and the stubs
+    const homeWith = (agents: string, os: string) => {
+      const home = mkdtempSync(join(tmpdir(), "codex-setup-"));
       const stubs = join(home, "stubs");
       mkdirSync(stubs);
       for (const name of ["git", "npm"]) writeFileSync(join(stubs, name), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+      writeFileSync(join(stubs, "uname"), `#!/bin/sh\necho ${os}\n`, { mode: 0o755 });
       mkdirSync(join(home, ".codex"));
-      writeFileSync(join(home, ".codex", "AGENTS.md"), "Mine.\n");
-      const { spawnSync } = await import("node:child_process");
+      writeFileSync(join(home, ".codex", "AGENTS.md"), agents);
       const run = () =>
         spawnSync("bash", [], {
           input: sh,
           env: { HOME: home, PATH: `${stubs}:${process.env.PATH}`, COMMONS_AGENT_KEY: "the-key" },
           encoding: "utf8",
         });
+      return { home, run };
+    };
+    const title = "# This environment runs an Anthill commons agent";
+    const { home, run } = homeWith("Mine.\n", "Linux");
+    try {
       const first = run();
       assert.equal(first.status, 0, first.stderr);
       assert.match(first.stdout, /commons agent environment ready/);
@@ -1098,15 +1106,20 @@ async function main() {
       assert.ok(!existsSync(`${home}/commons-kit/.kit-commit`));
       const agentsMd = readFileSync(join(home, ".codex", "AGENTS.md"), "utf8");
       assert.ok(agentsMd.startsWith("Mine.\n"), "what was there stays");
-      assert.equal(agentsMd.split("# This environment runs an Anthill commons agent").length, 2);
+      assert.equal(agentsMd.split(title).length, 2);
       for (const needed of [
         "the user's own AI agent in the\n`builders` agent commons",
+        // it asks for a round only of a task that runs the agent, with the
+        // key there: Codex reads this file in setup and edit sessions too
+        "When a task asks you to run the\nAnthill agent, and `COMMONS_AGENT_KEY` is set:",
+        "Otherwise, and while this environment is being set up or edited, ignore this.",
         `curl -fsSL ${BACKEND}/c/builders/commons/agent.md`,
         `\`${bin}/commons-agent\``,
         "never print it or\nyour environment",
       ]) {
         assert.ok(agentsMd.includes(needed), `AGENTS.md has ${JSON.stringify(needed)}`);
       }
+      assert.ok(!agentsMd.includes("Each session"), "no order for every session");
       // only the kit's two commands are allowed without asking
       assert.deepEqual(readdirSync(join(home, ".codex", "rules")), ["anthill-commons.rules"]);
       const rules = readFileSync(join(home, ".codex", "rules", "anthill-commons.rules"), "utf8");
@@ -1119,10 +1132,38 @@ async function main() {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+
+    // A file that doesn't end in a newline: the block still starts on a line
+    // of its own, so the second run replaces it instead of adding another.
+    const unended = homeWith("Mine.", "Linux");
+    try {
+      unended.run();
+      unended.run();
+      const agentsMd = readFileSync(join(unended.home, ".codex", "AGENTS.md"), "utf8");
+      assert.ok(agentsMd.startsWith("Mine.\n<!-- anthill commons agent -->\n"), "its marker starts a line");
+      assert.equal(agentsMd.split(title).length, 2, "one block after two runs");
+    } finally {
+      rmSync(unended.home, { recursive: true, force: true });
+    }
+
+    // On the member's own computer (Codex can run the line in a chat that
+    // works there) it stops before it installs or writes anything.
+    const mac = homeWith("Mine.\n", "Darwin");
+    try {
+      const refused = mac.run();
+      assert.notEqual(refused.status, 0);
+      assert.match(refused.stderr, /run this in the Codex cloud environment, not on your own computer/);
+      assert.doesNotMatch(refused.stdout, /ready/);
+      assert.deepEqual(readdirSync(join(mac.home, ".codex")), ["AGENTS.md"]);
+      assert.equal(readFileSync(join(mac.home, ".codex", "AGENTS.md"), "utf8"), "Mine.\n");
+      assert.deepEqual(readdirSync(mac.home).sort(), [".codex", "stubs"]);
+    } finally {
+      rmSync(mac.home, { recursive: true, force: true });
+    }
     expect(await call("/c/hidden/commons/codex-setup.sh"), 404);
     expect(await call("/c/plain/commons/codex-setup.sh"), 404);
   }
-  ok("the Codex setup script is rendered for the community, pinned like agent.md, and writes ~/.codex");
+  ok("the Codex setup script is rendered for the community, pinned like agent.md, and writes ~/.codex in its cloud only");
 
   ////////////////////////////////////////////
   //// communities without a commons
