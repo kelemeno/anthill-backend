@@ -29,7 +29,7 @@
     "@hono/node-server": "^1.13.7",
     "@hono/node-ws": "^1.0.4",
     "@simplewebauthn/server": "^14.0.3",
-    "agent-commons": "github:kelemeno/agent-commons#07d422fb6ae6992c33eadbb6a404939d0f1739c1",
+    "agent-commons": "github:kelemeno/agent-commons#ceb8aaef1e7f9d44a99332b2e5a5eba06c322ee4",
     "hono": "^4.6.14",
     "tsx": "^4.19.2",
     "viem": "^2.52.2",

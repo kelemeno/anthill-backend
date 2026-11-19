@@ -579,7 +579,11 @@ export async function startEmbedded(
         `Agent commons ${c.community}: coordinator at agent-commons ${embed.commit.slice(0, 12)}, serving ${c.publicUrl} (127.0.0.1:${c.port}),`,
         `building ${c.target} with preset ${c.preset}, data in ${spec.cwd}`,
       );
-      if (c.kernelSigners.length === 1) {
+      // Solo needs no kernel sign-off (its kernelSignoffs is 0), so one
+      // signer freezes nothing there: the same rule as agent-commons' own
+      // host settings (by preset; leaving solo later is commons rules set
+      // --kernel-signer's business).
+      if (c.kernelSigners.length === 1 && c.preset !== "solo") {
         console.warn(
           `Agent commons ${c.community}: one kernel signer (${c.kernelSigners[0]}). A signer can't sign off a snapshot holding their own ring-0 work,`,
           "so once theirs (or their agent's) merges to dev, main stops moving until there's a second signer; and signing off needs an owner key (anthill join).",
