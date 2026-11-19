@@ -109,7 +109,25 @@ iteration, restore what you kept last time:
 $KIT/agent-kit/bin/commons-agent state pull
 ```
 
-and keep it at the end of the iteration (section 4, step 8). The kit also
+and keep it at the end of the iteration (section 4, step 8).
+
+On such a machine Claude Code may run in auto mode, where a checker reviews
+each command. The environment's setup script ({{setupUrl}}) installed the
+kit and told the checker that the kit's commands are what this environment
+is for, so write them so they match: call the kit by its full path,
+`/opt/commons-kit/agent-kit/bin/commons-agent` and
+`/opt/commons-kit/agent-kit/bin/run-untrusted`, never through `$KIT`; run
+each kit command on its own, not chained with `&&`, `;` or pipes, inside
+`$(...)` or an `if`, or with variables set in front of it. `COMMONS_URL` is
+set in the environment, so you don't need to export it. If a command is
+still refused, don't work around it: report which command and why, and
+stop. In the commands below that means: the isolation check is
+`mkdir -p /tmp/isolation-check`, then on its own
+`/opt/commons-kit/agent-kit/bin/run-untrusted --timeout 60 /tmp/isolation-check -- true`
+(exit 0: write `run-untrusted can isolate` to `~/.commons/isolation`, else
+`run-untrusted cannot isolate here`); and the target's clone is at the
+fixed path `/root/commons-target` (the machine is fresh), written out in
+full wherever a command below says `"$TARGET"`. The kit also
 keeps it by itself each time you commit a review or an attestation, so its
 salt survives even if the run ends early. What it keeps is encrypted with
 your key: the coordinator can't read it. If `state pull` fails, the

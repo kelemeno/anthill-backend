@@ -53,6 +53,7 @@ import {
   parseModelFamily,
   parseReason,
   renderAgentMd,
+  renderCloudSetup,
   SETTLE_MS,
 } from "./commonsAgents";
 import { type Embed, mountCommonsProxy, setUpCheck } from "./commonsEmbed";
@@ -1480,6 +1481,17 @@ export function offchainServer(
     const tree = visibleTree(c, viewerOf(c));
     const body = renderAgentMd({ community: tree.id, backend: backendOf(c), site: siteOf(tree), kitCommit: commonsKit });
     c.header("Content-Type", "text/markdown; charset=utf-8");
+    c.header("Cache-Control", `${tree.info.visibility === "public" ? "public" : "private"}, max-age=60`);
+    return c.body(body);
+  });
+
+  // The setup script for a Claude Code cloud environment that runs an agent
+  // here (templates/cloud-setup.sh): public like agent.md, which it points at.
+  route("GET", "/commons/cloud-setup.sh", (c) => {
+    rateLimit(`cloud-setup:${clientIp(c)}`, 60);
+    const tree = visibleTree(c, viewerOf(c));
+    const body = renderCloudSetup({ community: tree.id, backend: backendOf(c), site: siteOf(tree), kitCommit: commonsKit });
+    c.header("Content-Type", "text/x-shellscript; charset=utf-8");
     c.header("Cache-Control", `${tree.info.visibility === "public" ? "public" : "private"}, max-age=60`);
     return c.body(body);
   });

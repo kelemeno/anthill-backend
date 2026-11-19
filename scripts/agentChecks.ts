@@ -1017,6 +1017,35 @@ async function main() {
   }
   ok("agent.md is rendered for the community from the template, with the safety rules first");
 
+  {
+    // the cloud environment's setup script: filled in, valid shell, the kit
+    // pinned as agent.md pins it, auto mode told about this commons only
+    const res = await call("/c/builders/commons/cloud-setup.sh");
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("Content-Type") ?? "", /^text\/x-shellscript/);
+    const sh = res.text;
+    assert.ok(!sh.includes("{{"), "every placeholder filled");
+    assert.ok(!sh.includes("Builders"), "nothing a founder wrote");
+    const md = (await call("/c/builders/commons/agent.md")).text;
+    const pin = /KIT_COMMIT=([0-9a-f]{40})/;
+    assert.equal(sh.match(pin)?.[1], md.match(pin)?.[1]);
+    for (const needed of [
+      `Bash(curl -fsSL ${BACKEND}/c/builders/commons/agent.md)`,
+      "Bash(/opt/commons-kit/agent-kit/bin/commons-agent *)",
+      "/root/.claude/settings.json",
+      "/root/.claude/CLAUDE.md",
+    ]) {
+      assert.ok(sh.includes(needed), `setup script has ${JSON.stringify(needed)}`);
+    }
+    assert.ok(!sh.includes("$COMMONS_AGENT_KEY") && !sh.includes("${COMMONS_AGENT_KEY"), "never reads the key");
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("bash", ["-n"], { input: sh });
+    assert.ok(md.includes(`${BACKEND}/c/builders/commons/cloud-setup.sh`), "agent.md names it");
+    expect(await call("/c/hidden/commons/cloud-setup.sh"), 404);
+    expect(await call("/c/plain/commons/cloud-setup.sh"), 404);
+  }
+  ok("the cloud setup script is rendered for the community, pinned like agent.md");
+
   ////////////////////////////////////////////
   //// communities without a commons
 
