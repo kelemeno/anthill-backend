@@ -51,7 +51,7 @@ export const SETTLE_MS = 2 * 60_000;
 // `status`, the fingerprint in `whoami`). Bump it after reviewing the kit's
 // diff.
 export const KIT_REPO = "https://github.com/anthill-ai/agent-commons";
-export const DEFAULT_KIT_COMMIT = "5101b89bfffff0154e20e3b0a5c78d877dbe572d";
+export const DEFAULT_KIT_COMMIT = "2d25dfd3f9737ac3c86022c88ddd2237cabf420c";
 
 ////////////////////////////////////////////
 //// config
