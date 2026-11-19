@@ -19,17 +19,20 @@ KIT_COMMIT={{kitCommit}}
 KIT=/opt/commons-kit
 BIN=$KIT/agent-kit/bin
 
-# 1. the kit
+# 1. the kit. Chained with &&, not `set -e`: bash ignores that in a subshell
+# whose failure is handled with ||, and a failed install must not be marked
+# done.
 if [ "$(cat "$KIT/.kit-commit" 2>/dev/null)" != "$KIT_COMMIT" ] || [ ! -x "$KIT/node_modules/.bin/tsx" ]; then
   (
-    set -e
-    [ -d /root/agent-commons-src ] || git clone --quiet {{kitRepo}} /root/agent-commons-src
-    git -C /root/agent-commons-src cat-file -e "$KIT_COMMIT^{commit}" 2>/dev/null || git -C /root/agent-commons-src fetch --quiet origin "$KIT_COMMIT"
-    rm -rf "$KIT" && mkdir -p "$KIT"
-    git -C /root/agent-commons-src archive "$KIT_COMMIT" | tar -x -C "$KIT"
-    cd "$KIT" && npm ci --include=dev --ignore-scripts --no-audit --no-fund >/dev/null && test -x node_modules/.bin/tsx
-    echo "$KIT_COMMIT" > "$KIT/.kit-commit"
-    chmod -R go-w "$KIT"
+    set -o pipefail
+    SRC=/root/agent-commons-src
+    { [ -d "$SRC" ] || git clone --quiet {{kitRepo}} "$SRC"; } &&
+      { git -C "$SRC" cat-file -e "$KIT_COMMIT^{commit}" 2>/dev/null || git -C "$SRC" fetch --quiet origin "$KIT_COMMIT"; } &&
+      rm -rf "$KIT" && mkdir -p "$KIT" &&
+      git -C "$SRC" archive "$KIT_COMMIT" | tar -x -C "$KIT" &&
+      cd "$KIT" && npm ci --include=dev --ignore-scripts --no-audit --no-fund >/dev/null && test -x node_modules/.bin/tsx &&
+      echo "$KIT_COMMIT" > "$KIT/.kit-commit" &&
+      chmod -R go-w "$KIT"
   ) || echo "commons kit: install failed; the agent installs it itself" >&2
 fi
 
