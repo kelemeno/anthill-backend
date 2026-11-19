@@ -6,7 +6,10 @@
 // - the pin: package.json names one exact commit, npm installed that one,
 //   tsx and git are there, and the pinned source still has what this relies
 //   on (its largest body is the proxy's cap, `commons host` takes every flag
-//   passed, loopback as a trusted proxy); a community the pinned commons
+//   passed, --embedded and --rules-preset included, loopback as a trusted
+//   proxy, the rules presets it knows); the kit agents install is that same
+//   commit, and its solo rules soak an hour and its head says solo (what
+//   one person testing alone needs); a community the pinned commons
 //   says can't start (`commons host --check`: a preset it doesn't know yet)
 //   is never started, nor advertised;
 // - the child's command line and environment (no backend secrets);
@@ -28,7 +31,9 @@
 //   flag) with the founder as kernel signer, no commons advertised before
 //   it's set up, serving through the proxy (the API's head, the playground
 //   and its script), the community summary's public URLs, an Agents pairing whose approval is relayed to the child on
-//   127.0.0.1 and lands in its ledger, and the child stopped at the end.
+//   127.0.0.1 and lands in its ledger, a proposal by that agent approved as a
+//   task on the website (approved-tasks.json in the child's folder) that the
+//   coordinator's own pass then appends, and the child stopped at the end.
 //
 //   npx tsx scripts/embedChecks.ts [--no-e2e] [--verbose]   (--verbose: the child's log)
 
@@ -195,6 +200,12 @@ async function main() {
     refused({ builders: { ...good, kernelSigners: [KALMAN.toUpperCase().replace("0X", "0x")] } }, /not an Anthill user id/);
     refused({ builders: { ...good, kernelSigners: [KALMAN, KALMAN] } }, /twice/);
     refused({ builders: { ...good, preset: "Phase 1" } }, /preset name/);
+    refused({ builders: { ...good, rulesPreset: "none" } }, /rulesPreset must be one of phase1, solo/);
+    refused({ builders: { ...good, rulesPreset: "Solo" } }, /rulesPreset must be one of/);
+    refused({ builders: { ...good, rulesPreset: null } }, /rulesPreset must be one of/);
+    // rulesPreset, from the file or a local override
+    assert.equal(e.readEmbed({ env: { COMMONS_EMBED: "true" }, port: 5001, configText: JSON.stringify({ builders: { ...good, rulesPreset: "phase1" } }), packageText }).embed!.communities[0].rulesPreset, "phase1");
+    assert.equal(e.readEmbed({ env: { COMMONS_EMBED: "true", COMMONS_EMBED_OVERRIDE: JSON.stringify({ builders: { rulesPreset: "solo" } }) }, port: 5411 }).embed!.communities[0].rulesPreset, "solo");
     refused({ builders: { ...good, port: 80 } }, /port from 1024/);
     refused({ builders: { ...good, port: 5001 } }, /already the backend's/);
     refused({ builders: good, others: { ...good } }, /already the backend's or another/);
@@ -237,9 +248,32 @@ async function main() {
     assert.ok(server.includes('e === "loopback"'), "the pinned commons trusts loopback as a proxy");
     const help = spawnSync(rt.node, ["--import", rt.tsx, rt.cli, "host", "--help"], { encoding: "utf8" });
     assert.equal(help.status, 0, help.stderr);
-    const spec = e.childSpec({ ...(e.readEmbed({ env: { RENDER: "true" }, port: 10000 }).embed!.communities[0]), allowFileTarget: true }, { communities: [], commit: PIN, dataDir: "/d", anthillUrl: "http://127.0.0.1:1" }, rt);
-    for (const flag of e.checkSpec(spec).args.filter((a) => a.startsWith("--") && a !== "--import")) assert.ok(help.stdout.includes(`  ${flag} `) || help.stdout.includes(`  ${flag}\n`), `commons host takes ${flag}`);
+    const spec = e.childSpec({ ...(e.readEmbed({ env: { RENDER: "true" }, port: 10000 }).embed!.communities[0]), allowFileTarget: true, rulesPreset: "solo" }, { communities: [], commit: PIN, dataDir: "/d", anthillUrl: "http://127.0.0.1:1" }, rt);
+    const flags = e.checkSpec(spec).args.filter((a) => a.startsWith("--") && a !== "--import");
+    for (const flag of ["--embedded", "--rules-preset"]) assert.ok(flags.includes(flag), flag);
+    for (const flag of flags) assert.ok(help.stdout.includes(`  ${flag} `) || help.stdout.includes(`  ${flag}\n`), `commons host takes ${flag}`);
     assert.deepEqual(e.checkSpec(spec).args.slice(0, 5), ["--import", rt.tsx, rt.cli, "host", "--check"]);
+
+    // the rules presets taken are the pin's; its solo rules soak an hour
+    // (one person sees a merge reach main in the same sitting), and the
+    // kit's head passes on the solo mode the coordinator adds
+    const pinnedRules = await import("agent-commons/src/rules.ts");
+    assert.deepEqual([...e.RULES_PRESETS].sort(), Object.keys(pinnedRules.PRESETS).sort(), "rulesPreset takes exactly the pin's presets");
+    assert.equal(pinnedRules.soloRules().promotion.soakFloorHours, 1, "the pinned solo rules soak an hour");
+    const { CommonsClient } = await import("agent-commons/src/client.ts");
+    const { generateKeyPair } = await import("agent-commons/src/crypto.ts");
+    const soloHead = { seq: 3, hash: "h", at: new Date().toISOString(), nextSeq: 4, mode: "solo", notice: "solo test" };
+    const headClient = new CommonsClient({ baseUrl: "http://127.0.0.1:1", agentKey: generateKeyPair(), fetch: (async () => Response.json(soloHead)) as never });
+    const head = (await headClient.head()) as { mode?: string };
+    assert.equal(head.mode, "solo", "the pinned kit's commons-agent head passes on the solo mode");
+    for (const role of ["worker", "reviewer", "spec-writer"]) {
+      assert.match(readFileSync(join(commonsSrc, "..", "agent-kit", "roles", `${role}.md`), "utf8"), /## Solo mode/, `the pinned ${role}.md says what solo means`);
+    }
+    // the kit agents install is the coordinator's own commit: a kit older
+    // than the coordinator drops what it says (head's solo mode) and its role
+    // files miss what it does
+    const { DEFAULT_KIT_COMMIT } = await import("../src/commonsAgents");
+    assert.equal(DEFAULT_KIT_COMMIT, PIN, "DEFAULT_KIT_COMMIT (the kit agents install) is the pinned agent-commons commit");
   }
   ok("package.json pins one commit, npm installed it, tsx and git are there, the pinned source has what the proxy and the child rely on");
 
@@ -274,9 +308,14 @@ async function main() {
       "--target-repo", "https://github.com/kelemeno/agent-commons",
       "--kernel-signer", KALMAN,
       "--preset", "solo",
+      "--embedded",
       "--loop-seconds", "30",
     ]);
     assert.ok(!spec.args.includes("--hold-on-failure"));
+    // with a rulesPreset: passed on, so leaving solo needs no shell
+    const switching = e.childSpec({ ...c.communities[0], rulesPreset: "phase1" }, { ...c, dataDir: "/var/data" }, rt, {});
+    const at = switching.args.indexOf("--rules-preset");
+    assert.ok(at > 0 && switching.args[at + 1] === "phase1", JSON.stringify(switching.args));
   }
   ok("the child: commons host on 127.0.0.1 under /commons/<community>, trusting loopback, linked to this backend, without the backend's secrets");
 
@@ -586,7 +625,7 @@ async function main() {
     note("skipped the end-to-end run (--no-e2e)");
   } else {
     await endToEnd(e, rt, scratch);
-    ok("end to end: nothing advertised before setup; the pinned commons sets itself up from a local target, serves its API and playground through the proxy, the summary has the public URLs, and an approved pairing is relayed to it on 127.0.0.1 and lands in its ledger");
+    ok("end to end: nothing advertised before setup; the pinned commons sets itself up from a local target, serves its API and playground through the proxy, the summary has the public URLs, an approved pairing is relayed to it on 127.0.0.1 and lands in its ledger, and its agent's proposal, approved as a task on the website, is appended by the coordinator");
   }
   rmSync(scratch, { recursive: true, force: true });
   console.log("all embed checks passed");
@@ -598,6 +637,8 @@ function agentKey() {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   return {
     publicKey: publicKey.export({ type: "spki", format: "der" }).toString("base64url"),
+    // as agent-commons keeps it (pkcs8 DER, base64url)
+    privateKey: privateKey.export({ type: "pkcs8", format: "der" }).toString("base64url"),
     sign: (message: string) => sign(null, Buffer.from(message, "utf8"), privateKey).toString("base64url"),
   };
 }
@@ -641,14 +682,14 @@ async function endToEnd(e: typeof import("../src/commonsEmbed"), rt: import("../
   });
 
   // the backend, with builders' coordinator from the committed config and
-  // the local overrides: the target on this disk, phase1, a port of its
+  // the local overrides: the target on this disk, solo (as committed), a port of its
   // own. The kernel signer is the founder, whose id exists only once they've
   // signed up: set before the child starts (only the child's command uses it).
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     COMMONS_EMBED: "true",
     COMMONS_EMBED_TEST_FILE_TARGET: "true",
-    COMMONS_EMBED_OVERRIDE: JSON.stringify({ builders: { target: `file://${target}`, preset: "phase1", port: childPort } }),
+    COMMONS_EMBED_OVERRIDE: JSON.stringify({ builders: { target: `file://${target}`, preset: "solo", port: childPort } }),
   };
   const embed = e.readEmbed({ env, port }).embed!;
   const builders = embed.communities[0];
@@ -698,9 +739,13 @@ async function endToEnd(e: typeof import("../src/commonsEmbed"), rt: import("../
     });
     assert.equal(head.headers.get("content-type"), "application/json; charset=utf-8");
     assert.equal(typeof head.data.seq, "number");
+    // solo, as the committed config: the head says so (the kit passes it on)
+    assert.equal(head.data.mode, "solo");
     if (!process.argv.includes("--verbose")) {
       assert.ok(lines.some((l) => l.startsWith("[commons builders] commons host: setup done")), lines.join("\n"));
       assert.ok(lines.every((l) => l.startsWith("[commons builders] ")));
+      // --embedded: no COMMONS_SITES line to set (the backend lists the site)
+      assert.ok(!lines.some((l) => l.includes("COMMONS_SITES")), lines.join("\n"));
     }
     const data = join(dataDir, "commons", "builders");
     assert.ok(existsSync(join(data, "commons-ledger.jsonl")));
@@ -747,6 +792,40 @@ async function endToEnd(e: typeof import("../src/commonsEmbed"), rt: import("../
     const direct = await (await fetch(`${builders.internalUrl}/api/agents?owner=${founder.user.id}`)).json();
     assert.equal(direct.agents[0].keyId, link.keyIdOf(agent.publicKey));
     assert.ok(readFileSync(join(data, "commons-ledger.jsonl"), "utf8").includes(agent.publicKey));
+
+    // the agent proposes work (an entry it signs, through the proxy); the
+    // founder, the community's steward, approves it as a task on the
+    // website; the backend writes approved-tasks.json in the child's folder,
+    // and the coordinator's next pass (every 30 seconds) appends the task
+    const { signEntry } = await import("agent-commons/src/ledger.ts");
+    const now = expect(await call("/commons/builders/api/head"), 200);
+    const proposal = signEntry(
+      { seq: now.nextSeq, prev: now.hash },
+      { kind: "proposal", id: "p-e2e", title: "Say hello in the README", evidence: [{ kind: "location", file: "README.md", line: 1, note: "no greeting" }] },
+      agent,
+      new Date().toISOString(),
+    );
+    expect(await call("/commons/builders/api/entries", proposal), 201);
+    const proposals = await until("the proposal on the website", 30_000, async () => {
+      const r = await call("/c/builders/commons/proposals", undefined, founder.token);
+      return r.status === 200 && r.data.proposals.some((p: any) => p.id === "p-e2e") ? r.data : undefined;
+    });
+    assert.equal(proposals.canApprove, true);
+    assert.deepEqual(proposals.proposals[0].author.owner, { id: founder.user.id, name: "Founder" });
+    const approvedTask = expect(await call("/c/builders/commons/proposals/p-e2e/approve", { ring: 2, sizeEstimate: 3, acceptanceTests: ["test/readme.test.ts"] }, founder.token), 200);
+    assert.equal(approvedTask.proposal.task.status, "pending");
+    assert.equal(JSON.parse(readFileSync(join(data, "approved-tasks.json"), "utf8"))[0].proposalId, "p-e2e");
+    const task = await until("the coordinator to append the approved task", 120_000, async () => {
+      const r = await (await fetch(`${builders.internalUrl}/api/tasks`)).json();
+      return r.tasks.find((t: any) => t.untrusted?.proposalId === "p-e2e");
+    });
+    assert.deepEqual([task.ring, task.sizeEstimate, task.acceptanceTestPaths, task.specAuthor, task.status], [2, 3, ["test/readme.test.ts"], founder.user.id, "open"]);
+    const created = await until("the task as created on the website", 30_000, async () => {
+      const r = await call("/c/builders/commons/proposals", undefined, founder.token);
+      const p = r.data.proposals?.find((x: any) => x.id === "p-e2e");
+      return p?.task?.status === "created" ? p.task : undefined;
+    });
+    assert.equal(created.id, task.id);
   } catch (err) {
     console.error(lines.join("\n"));
     throw err;

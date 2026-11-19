@@ -17,7 +17,9 @@
 // Communities with an agent commons (COMMONS_SITES, or one this backend runs
 // itself: commonsEmbed.ts, proxied at /commons/<id>/) also have pairing
 // routes for members' agents, their agents' list and revoke, and the agent
-// instructions page (see commonsAgents.ts); others answer 404 there.
+// instructions page (see commonsAgents.ts); others answer 404 there. One this
+// backend runs itself also lists its agents' proposals, and its steward
+// approves them as tasks here (see commonsTasks.ts); others answer 404 there.
 //
 // The WebSocket says "update:<key>" after a change in a community: the key is
 // the id of a public one, and an opaque key for a private one (in its /graph
@@ -55,6 +57,19 @@ import {
 } from "./commonsAgents";
 import { type Embed, mountCommonsProxy, setUpCheck } from "./commonsEmbed";
 import { CommonsSigner, isCommonsPublicKey, verifyPairProof } from "./commonsLink";
+import {
+  approve,
+  approvedTasksPath,
+  decline,
+  LEDGER_ID,
+  LedgerReader,
+  parseApproval,
+  proposalList,
+  proposalView,
+  readApproved,
+  sizeLimits,
+  TASK_LIMITS,
+} from "./commonsTasks";
 import { address0, address1, type GraphData } from "./dagBase";
 import { type History, type HistoryNode, type HistoryStep, snapshotNodes } from "./dagHistory";
 import { loadAnthillGraph } from "./dagLoading";
@@ -413,6 +428,10 @@ export function offchainServer(
       const out = [...operatorSites];
       for (const [id, own] of embeddedSites) if (own.setUp()) out.push([id, own.site]);
       return out;
+    },
+    // set up (an embedded one counts once its ledger exists, like get)
+    has(id: string): boolean {
+      return this.get(id) !== undefined;
     },
     // every configured one, set up or not
     ids: () => [...operatorSites.keys(), ...embeddedSites.keys()],
@@ -1463,6 +1482,155 @@ export function offchainServer(
     c.header("Content-Type", "text/markdown; charset=utf-8");
     c.header("Cache-Control", `${tree.info.visibility === "public" ? "public" : "private"}, max-age=60`);
     return c.body(body);
+  });
+
+  ////////////////////////////////////////////
+  //// agents' proposals into tasks, in a commons this backend runs (see
+  //// commonsTasks.ts): listed for whoever can see the community, approved
+  //// (or a pending approval declined) by whoever may change its settings
+
+  const embeddedById = new Map((options.embed?.communities ?? []).map((e) => [e.community, e]));
+  const readers = new Map<string, LedgerReader>();
+  const nameOf = (id: string) => store.user(id)?.name ?? "";
+
+  // The community's own coordinator, once set up, or a 404 (none, or the
+  // operator's commons elsewhere: its folder isn't this backend's).
+  function embeddedHere(tree: OffchainTree) {
+    const own = embeddedSites.get(tree.id);
+    const commons = embeddedById.get(tree.id);
+    if (own === undefined || commons === undefined || options.embed === undefined || !own.setUp()) throw new NotFoundError();
+    let reader = readers.get(tree.id);
+    if (reader === undefined) {
+      reader = new LedgerReader(tree.id, commons.internalUrl, options.fetch);
+      readers.set(tree.id, reader);
+    }
+    return { reader, file: approvedTasksPath(commons, options.embed) };
+  }
+
+  function requireTaskSteward(tree: OffchainTree, user: string) {
+    if (tree.canChangeSettings(user)) return;
+    throw new ActionError(
+      tree.info.createdBy === ""
+        ? "Only the root of the tree can approve tasks in a community without a founder."
+        : "Only the founder can approve tasks in this community.",
+      "not steward",
+    );
+  }
+
+  // A proposal id from the path (the ledger's id rule), or a refusal.
+  function proposalParam(c: Context) {
+    const id = param(c, "id");
+    if (id.length > TASK_LIMITS.id || !LEDGER_ID.test(id)) throw new ActionError("There's no such proposal in this commons.");
+    return id;
+  }
+
+  // A page of proposals: { proposals, next, total, canApprove }. The first
+  // page (no ?before) starts with every one waiting on the coordinator (a
+  // pending approval, or one declined just now: `watchUntil`), then the
+  // others newest first; `next` is the ?before= of the next page (null: no
+  // more). Each lists a few pieces of evidence (`evidenceTotal`: all of
+  // them, from GET /commons/proposals/:id). For whoever may approve, also
+  // who can be a spec author (the commons' owners), whether they're one, and
+  // the sizes a task can have (`sizeLimits`). A file the backend can't read
+  // lists every proposal as without an approval, and says so in `problem`.
+  route("GET", "/commons/proposals", async (c) => {
+    const viewer = viewerOf(c);
+    rateLimit(`commons-proposals:${viewer ?? clientIp(c)}`, 30);
+    const tree = visibleTree(c, viewer);
+    const { reader, file } = embeddedHere(tree);
+    const beforeParam = c.req.query("before");
+    let before: number | undefined;
+    if (beforeParam !== undefined) {
+      if (!/^\d{1,15}$/.test(beforeParam)) throw new ActionError("before must be a whole number (the next of the page before).");
+      before = Number(beforeParam);
+    }
+    const view = await reader.read();
+    let approved: unknown[] = [];
+    let problem: string | undefined;
+    try {
+      approved = readApproved(file);
+    } catch (e) {
+      if (!(e instanceof RelayError)) throw e;
+      problem = e.message;
+    }
+    const steward = tree.canChangeSettings(viewer);
+    const { proposals, next } = proposalList(view, approved, nameOf, { file, before });
+    return c.json({
+      proposals,
+      next,
+      total: view.proposals.size,
+      canApprove: steward,
+      ...(steward
+        ? {
+            owners: [...view.owners]
+              .filter((id) => /^0x[0-9a-f]{40}$/.test(id))
+              .map((id) => ({ id, name: nameOf(id) }))
+              .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id)),
+            youAreOwner: viewer !== undefined && view.owners.has(viewer),
+            ...(view.rules === undefined ? {} : { sizeLimits: sizeLimits(view.rules) }),
+          }
+        : {}),
+      ...(problem === undefined ? {} : { problem }),
+    });
+  });
+
+  // One proposal, all its evidence: { proposal }.
+  route("GET", "/commons/proposals/:id", async (c) => {
+    const viewer = viewerOf(c);
+    rateLimit(`commons-proposals:${viewer ?? clientIp(c)}`, 30);
+    const tree = visibleTree(c, viewer);
+    const { reader, file } = embeddedHere(tree);
+    const proposalId = proposalParam(c);
+    const view = await reader.read();
+    const p = view.proposals.get(proposalId);
+    if (p === undefined) throw new NotFoundError();
+    let approved: unknown[] = [];
+    try {
+      approved = readApproved(file);
+    } catch (e) {
+      if (!(e instanceof RelayError)) throw e;
+    }
+    return c.json({ proposal: proposalView(view, approved, p, nameOf, { file }) });
+  });
+
+  // Body: { ring: 0|1|2, sizeEstimate, acceptanceTests: [exact paths, no
+  // wildcards], specAuthor? (an owner's user id; you by default) }. The size
+  // is held to the ledger's rules (sizeLimits in the list). The coordinator
+  // appends the task on its next pass (every 30 seconds). Approving again is
+  // the same task: { added: false }. Answers { added, proposal }.
+  route("POST", "/commons/proposals/:id/approve", async (c) => {
+    const user = signedIn(c);
+    rateLimit(`commons-task:${user.id}`, 20);
+    const tree = visibleTree(c, user.id);
+    const { reader, file } = embeddedHere(tree);
+    requireTaskSteward(tree, user.id);
+    const proposalId = proposalParam(c);
+    const fields = parseApproval(await jsonBody(c), user.id);
+    // what's decided on is the ledger now
+    const view = await reader.read(0);
+    const { added } = await approve(file, view, proposalId, fields);
+    return c.json({ added, proposal: proposalView(view, readApproved(file), view.proposals.get(proposalId)!, nameOf, { file }) });
+  });
+
+  // Takes back an approval the coordinator hasn't acted on yet (one it has
+  // is a task for good). A pass that read the file just before may still
+  // append it: the proposal is watched until `watchUntil` (ISO), in this
+  // answer and in the list, and shows as created if it lands. Answers
+  // { removed, proposal, watchUntil? }.
+  route("POST", "/commons/proposals/:id/decline", async (c) => {
+    const user = signedIn(c);
+    rateLimit(`commons-task:${user.id}`, 20);
+    const tree = visibleTree(c, user.id);
+    const { reader, file } = embeddedHere(tree);
+    requireTaskSteward(tree, user.id);
+    const proposalId = proposalParam(c);
+    const view = await reader.read(0);
+    const { removed, watchUntil } = await decline(file, view, proposalId);
+    return c.json({
+      removed,
+      proposal: proposalView(view, readApproved(file), view.proposals.get(proposalId)!, nameOf, { file }),
+      ...(watchUntil === undefined ? {} : { watchUntil: new Date(watchUntil).toISOString() }),
+    });
   });
 
   app.get("/invites/:code", (c) => {

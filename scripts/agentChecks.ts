@@ -15,14 +15,20 @@
 // map; no pairing in a private community; the agents list and revoke,
 // relayed and signed, for who left a private community too, a 64-character
 // model family included; the relay's cache and budgets; the agent
-// instructions page; 404s for a community without a commons; the agent's
+// instructions page (the iteration's order, proposing work when there's
+// nothing else, claiming only a task whose tests exist, one of an owner's
+// agents writing a spec, and its ledger summary run against a fake
+// coordinator); 404s for a community without a commons; the agent's
 // routes limited per IP; nothing about pairings in the log; and deleting an
 // account revokes its agents first.
 //
 //   npx tsx scripts/agentChecks.ts
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -922,6 +928,84 @@ async function main() {
     assert.ok(at("**Reviews assigned to you first.**") < at("**Then work you've claimed.**"));
     assert.ok(at("**Then work you've claimed.**") < at("**Then open tasks.**"));
     assert.ok(at("**Then open tasks.**") < at("**Then spec writing.**"));
+    // with nothing else to do, an agent proposes work: the first step from
+    // pairing to a task (the website's steward approves proposals)
+    assert.ok(at("**Then spec writing.**") < at("**Then propose work.**"));
+    assert.ok(at("**Then propose work.**") < at("**Report** to your owner"));
+    for (const needed of [
+      "commons-agent propose --title '<one line, at most 300 characters>' --evidence \"$work/evidence.json\"",
+      '{"kind": "failingTest", "testId": "<the test file\'s path>", "command": "<the command you ran>"}',
+      '"kind": "diagnostic"',
+      "at most one proposal per\n   iteration",
+      "Skip anything already proposed",
+      // a task is claimed only once its tests exist, and one agent writes a spec
+      "only if every one of its `acceptanceTestPaths` already exists on the\n   base you will submit against",
+      "the one whose `keyId` sorts first",
+      "In solo,\n     either of your owner's agents may write a spec, but only one should",
+      '"mode": "solo"',
+      // read-only iterations do none of it
+      "(steps 1, 2 and 8 only: no review commits,\nattestations, claims, specs or proposals;",
+    ]) {
+      assert.ok(md.includes(needed), `agent.md has ${JSON.stringify(needed)}`);
+    }
+    // the steps are numbered in order, 1 to 8
+    const steps = [...md.matchAll(/^(\d)\. \*\*/gm)].map((m) => Number(m[1]));
+    assert.deepEqual(steps.slice(steps.lastIndexOf(1)), [1, 2, 3, 4, 5, 6, 7, 8]);
+
+    // the ledger summary, as printed, against a coordinator's /api/entries
+    // (two pages): proposals with their task, submissions merged or failed
+    const script = /node -e '\n([\s\S]*?)' > ~\/\.commons\/ledger-summary\.json/.exec(md)?.[1];
+    assert.ok(script, "agent.md has the ledger summary");
+    const ledgerEntries = [
+      { seq: 0, at: "t0", body: { kind: "genesis" } },
+      { seq: 1, at: "t1", body: { kind: "proposal", id: "p-1", title: "Fix it", evidence: [{ kind: "location", file: "a.ts", line: 1, note: "n" }] } },
+      { seq: 2, at: "t2", body: { kind: "task", id: "t-1", proposalId: "p-1", ring: 1, acceptanceTestPaths: ["test/a.test.ts"], sizeEstimate: 5, specAuthor: "0x1" } },
+      { seq: 3, at: "t3", body: { kind: "submission", id: "s-spec", taskId: null, changedFiles: ["test/a.test.ts"] } },
+      { seq: 4, at: "t4", body: { kind: "submission", id: "s-bad", taskId: "t-1", changedFiles: ["a.ts"] } },
+      { seq: 5, at: "t5", body: { kind: "gateResult", submissionId: "s-bad", gate: "size", pass: false, details: "" } },
+      { seq: 6, at: "t6", body: { kind: "merge", submissionId: "s-spec", commit: "c" } },
+      { seq: 7, at: "t7", body: { kind: "proposal", id: "p-2", title: "Another", evidence: [] } },
+    ];
+    const fake = http.createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://x");
+      if (url.pathname !== "/commons/builders/api/entries") {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end('{"error":"not-found"}');
+        return;
+      }
+      const since = Number(url.searchParams.get("since"));
+      const page = ledgerEntries.slice(since, since + 5);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ since, next: since + page.length < ledgerEntries.length ? since + page.length : null, entries: page }));
+    });
+    await new Promise<void>((r) => fake.listen(0, "127.0.0.1", () => r()));
+    try {
+      const url = `http://127.0.0.1:${(fake.address() as AddressInfo).port}/commons/builders`;
+      const run = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+        const child = spawn(process.execPath, ["-e", script], { env: { PATH: process.env.PATH, COMMONS_URL: url } });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (d: Buffer) => (stdout += d));
+        child.stderr.on("data", (d: Buffer) => (stderr += d));
+        child.on("close", (status) => resolve({ status, stdout, stderr }));
+      });
+      assert.equal(run.status, 0, run.stderr);
+      assert.deepEqual(JSON.parse(run.stdout), {
+        proposals: [
+          { id: "p-1", title: "Fix it", evidence: [{ kind: "location", file: "a.ts", line: 1, note: "n" }], task: { id: "t-1", at: "t2" } },
+          { id: "p-2", title: "Another", evidence: [] },
+        ],
+        submissions: {
+          "s-spec": { taskId: null, changedFiles: ["test/a.test.ts"], merged: true, failedGate: false },
+          "s-bad": { taskId: "t-1", changedFiles: ["a.ts"], merged: false, failedGate: true },
+        },
+      });
+      // a coordinator it can't read: exit 4
+      const down = await new Promise<number | null>((resolve) => spawn(process.execPath, ["-e", script], { env: { PATH: process.env.PATH, COMMONS_URL: `${url}/nowhere` }, stdio: "ignore" }).on("close", resolve));
+      assert.equal(down, 4);
+    } finally {
+      await new Promise<void>((r) => fake.close(() => r()));
+    }
     // nothing a founder wrote: not the community's name
     assert.ok(!md.includes("Builders"));
     // a private community's page is for its members, the operator's repo in it

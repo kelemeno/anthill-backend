@@ -20,8 +20,15 @@
 //   names is the operator's commons elsewhere: none is started for it.
 // - Config is code: commons.config.json, `{ "<community>": { "target":
 //   "https://...", "kernelSigners": ["0x..."], "preset": "...", "port":
-//   5101 } }`. The preset is passed as it is: the pinned commons decides
-//   which names it knows. Before starting a child the backend asks the
+//   5101, "rulesPreset"?: "phase1" | "solo" } }`. The preset is passed as it
+//   is: the pinned commons decides which names it knows (at setup only).
+//   rulesPreset switches an existing ledger's rules to that preset
+//   (`commons host --rules-preset`, COMMONS_RULES_PRESET there): once per
+//   value, at the next start after a deploy, so leaving solo (phase1), or
+//   applying a newer pin's solo rules to a ledger set up under an older
+//   one, needs no shell. Leaving solo while solo-reviewed work is stranded
+//   is refused there (it serves on under the rules as they are, and says
+//   why in the log). Before starting a child the backend asks the
 //   pinned commons (`commons host --check`, same flags) whether it can start:
 //   one it can't (a preset the pin doesn't know yet, on a fresh disk) isn't
 //   started, and that is logged, until a deploy that fixes it. For local tests,
@@ -103,6 +110,8 @@ export type EmbeddedCommons = {
   target: string;
   kernelSigners: string[];
   preset: string;
+  // switch an existing ledger's rules to this preset (once per value)
+  rulesPreset?: (typeof RULES_PRESETS)[number];
   // the child's own port, on 127.0.0.1
   port: number;
   // where the backend serves it: /commons/<community>
@@ -128,7 +137,12 @@ const COMMUNITY_ID = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
 const RESERVED = new Set(["key", "tree", "owner", "pairings", "agents"]);
 const USER_ID = /^0x[0-9a-f]{40}$/;
 const PRESET = /^[a-z0-9][a-z0-9-]{0,31}$/;
-const FIELDS = new Set(["target", "kernelSigners", "preset", "port"]);
+// The presets `commons host --rules-preset` takes (agent-commons rules.ts
+// PRESETS; embedChecks.ts checks them against the pin). Unlike the setup
+// preset, `--check` doesn't judge it: an unknown one would stop the child at
+// every start, so it's refused here.
+export const RULES_PRESETS = ["phase1", "solo"] as const;
+const FIELDS = new Set(["target", "kernelSigners", "preset", "port", "rulesPreset"]);
 
 // The backend's public address (as offchainApi.ts gives agents): PUBLIC_URL,
 // else the one Render gives the service.
@@ -175,7 +189,7 @@ function targetUrl(v: unknown, where: string, allowFile: boolean): string {
   return v;
 }
 
-type Entry = { target?: unknown; kernelSigners?: unknown; preset?: unknown; port?: unknown };
+type Entry = { target?: unknown; kernelSigners?: unknown; preset?: unknown; port?: unknown; rulesPreset?: unknown };
 
 function entries(text: string, where: string): Map<string, Entry> {
   let parsed: unknown;
@@ -238,6 +252,9 @@ export function readEmbed(o: {
       kernelSigners.push(s);
     }
     if (typeof e.preset !== "string" || !PRESET.test(e.preset)) throw new Error(`${where("preset")} must be a preset name, like phase1`);
+    if (e.rulesPreset !== undefined && !RULES_PRESETS.includes(e.rulesPreset as (typeof RULES_PRESETS)[number])) {
+      throw new Error(`${where("rulesPreset")} must be one of ${RULES_PRESETS.join(", ")} (or left out)`);
+    }
     if (typeof e.port !== "number" || !Number.isInteger(e.port) || e.port < 1024 || e.port > 65535) throw new Error(`${where("port")} must be a port from 1024 to 65535`);
     if (ports.has(e.port)) throw new Error(`${where("port")}: ${e.port} is already the backend's or another commons' port`);
     ports.add(e.port);
@@ -251,6 +268,7 @@ export function readEmbed(o: {
       target,
       kernelSigners,
       preset: e.preset,
+      ...(e.rulesPreset === undefined ? {} : { rulesPreset: e.rulesPreset as (typeof RULES_PRESETS)[number] }),
       port: e.port,
       basePath,
       publicUrl: `${backend}${basePath}`,
@@ -340,6 +358,8 @@ const CHILD_ENV = ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
 // community on this backend), then serves the API and the playground under
 // its base path, with a coordinator pass every 30 seconds. Without
 // --hold-on-failure it exits 2 when it can't go on, and is restarted.
+// --embedded: the backend lists its site itself, so setup prints no
+// COMMONS_SITES line to set.
 export function childSpec(c: EmbeddedCommons, embed: Embed, rt: Runtime, env: NodeJS.ProcessEnv = process.env): ChildSpec {
   const data = childDataDir(c, embed);
   const childEnv: NodeJS.ProcessEnv = {};
@@ -359,6 +379,8 @@ export function childSpec(c: EmbeddedCommons, embed: Embed, rt: Runtime, env: No
       "--target-repo", c.target,
       ...c.kernelSigners.flatMap((s) => ["--kernel-signer", s]),
       "--preset", c.preset,
+      ...(c.rulesPreset === undefined ? [] : ["--rules-preset", c.rulesPreset]),
+      "--embedded",
       "--loop-seconds", "30",
       ...(c.allowFileTarget ? ["--test-allow-file-target"] : []),
     ],
@@ -577,7 +599,7 @@ export async function startEmbedded(
       }
       console.log(
         `Agent commons ${c.community}: coordinator at agent-commons ${embed.commit.slice(0, 12)}, serving ${c.publicUrl} (127.0.0.1:${c.port}),`,
-        `building ${c.target} with preset ${c.preset}, data in ${spec.cwd}`,
+        `building ${c.target} with preset ${c.preset}${c.rulesPreset === undefined ? "" : ` (rules preset ${c.rulesPreset}, applied once per value)`}, data in ${spec.cwd}`,
       );
       // Solo needs no kernel sign-off (its kernelSignoffs is 0), so one
       // signer freezes nothing there: the same rule as agent-commons' own
